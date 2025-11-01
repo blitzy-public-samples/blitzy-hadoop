@@ -126,6 +126,19 @@
       <artifactId>jakarta.activation-api</artifactId>
       <scope>runtime</scope>
     </dependency>
+    <!-- JAXB API for Java 21 compatibility - JAXB removed from JDK in Java 11+ -->
+    <dependency>
+      <groupId>jakarta.xml.bind</groupId>
+      <artifactId>jakarta.xml.bind-api</artifactId>
+      <version>4.0.0</version>
+    </dependency>
+    <!-- JAXB Runtime Implementation for Java 21 compatibility -->
+    <dependency>
+      <groupId>org.glassfish.jaxb</groupId>
+      <artifactId>jaxb-runtime</artifactId>
+      <version>4.0.3</version>
+      <scope>runtime</scope>
+    </dependency>
     <dependency>
       <groupId>org.eclipse.jetty</groupId>
       <artifactId>jetty-server</artifactId>
