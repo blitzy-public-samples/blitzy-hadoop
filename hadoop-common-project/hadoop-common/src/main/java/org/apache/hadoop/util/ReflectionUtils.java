@@ -22,6 +22,9 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.io.UnsupportedEncodingException;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadInfo;
 import java.lang.management.ThreadMXBean;
@@ -29,6 +32,8 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -61,9 +66,11 @@ public class ReflectionUtils {
   /** 
    * Cache of constructors for each class. Pins the classes so they
    * can't be garbage collected until ReflectionUtils can be collected.
+   * In Java 21, may cache either Constructor<?> or MethodHandle objects
+   * depending on which reflection approach succeeded.
    */
-  private static final Map<Class<?>, Constructor<?>> CONSTRUCTOR_CACHE = 
-    new ConcurrentHashMap<Class<?>, Constructor<?>>();
+  private static final Map<Class<?>, Object> CONSTRUCTOR_CACHE = 
+    new ConcurrentHashMap<Class<?>, Object>();
 
   /**
    * Check and set 'configuration' if necessary.
@@ -146,13 +153,33 @@ public class ReflectionUtils {
           + " arguments are provided");
     }
     try {
-      Constructor<T> meth = (Constructor<T>) CONSTRUCTOR_CACHE.get(theClass);
-      if (meth == null) {
-        meth = theClass.getDeclaredConstructor(argTypes);
-        meth.setAccessible(true);
-        CONSTRUCTOR_CACHE.put(theClass, meth);
+      Object cached = CONSTRUCTOR_CACHE.get(theClass);
+      if (cached == null) {
+        // Java 21 strong encapsulation compliance: attempt MethodHandles.privateLookupIn
+        try {
+          MethodHandles.Lookup lookup = MethodHandles.privateLookupIn(theClass, MethodHandles.lookup());
+          MethodType mt = MethodType.methodType(void.class, argTypes);
+          MethodHandle handle = lookup.findConstructor(theClass, mt);
+          CONSTRUCTOR_CACHE.put(theClass, handle);
+          result = (T) handle.invokeWithArguments(values);
+        } catch (Throwable t) {
+          // Fallback: use traditional Constructor with setAccessible via doPrivileged
+          Constructor<T> meth = theClass.getDeclaredConstructor(argTypes);
+          AccessController.doPrivileged((PrivilegedAction<Void>) () -> {
+            meth.setAccessible(true);
+            return null;
+          });
+          CONSTRUCTOR_CACHE.put(theClass, meth);
+          result = meth.newInstance(values);
+        }
+      } else {
+        // Use cached item (either MethodHandle or Constructor)
+        if (cached instanceof MethodHandle) {
+          result = (T) ((MethodHandle) cached).invokeWithArguments(values);
+        } else {
+          result = ((Constructor<T>) cached).newInstance(values);
+        }
       }
-      result = meth.newInstance(values);
     } catch (Exception e) {
       throw new RuntimeException(e);
     }
