@@ -213,6 +213,25 @@
       <artifactId>jettison</artifactId>
       <scope>compile</scope>
     </dependency>
+    <!-- OLD javax.xml.bind for test framework compatibility (Jersey 2.x requires javax namespace) -->
+    <dependency>
+      <groupId>javax.xml.bind</groupId>
+      <artifactId>jaxb-api</artifactId>
+      <version>2.3.1</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.sun.xml.bind</groupId>
+      <artifactId>jaxb-impl</artifactId>
+      <version>2.3.9</version>
+      <scope>test</scope>
+    </dependency>
+    <!-- NEW jakarta.xml.bind for production code (Java 21 requirement) -->
+    <dependency>
+      <groupId>org.glassfish.jaxb</groupId>
+      <artifactId>jaxb-runtime</artifactId>
+      <scope>runtime</scope>
+    </dependency>
   </dependencies>
 
   <build>

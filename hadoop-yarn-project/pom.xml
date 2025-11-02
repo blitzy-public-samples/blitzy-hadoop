@@ -34,7 +34,7 @@
     - maven-compiler-plugin 3.11.0 (Java 21 compilation support)
     - maven-surefire-plugin 3.1.2 (Java 21 test execution support)
     - maven-javadoc-plugin 3.5.0 (Java 21 javadoc generation)
-    - extraJavaTestArgs with --add-opens flags (test reflection access for Java 21)
+    - extraJavaTestArgs with add-opens flags (test reflection access for Java 21)
     
     Module Propagation:
     The child module 'hadoop-yarn' and all its descendants automatically inherit

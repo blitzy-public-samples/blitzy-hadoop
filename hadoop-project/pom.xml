@@ -68,7 +68,7 @@
     <jersey2.version>2.46</jersey2.version>
 
     <!-- jaxb version -->
-    <jaxb.version>2.3.9</jaxb.version>
+    <jaxb.version>4.0.3</jaxb.version>
 
     <!-- jackson versions -->
     <jackson2.version>2.14.3</jackson2.version>
@@ -1553,7 +1553,7 @@
       <dependency>
         <groupId>jakarta.xml.bind</groupId>
         <artifactId>jakarta.xml.bind-api</artifactId>
-        <version>2.3.3</version>
+        <version>4.0.0</version>
       </dependency>
       <dependency>
         <groupId>org.codehaus.jettison</groupId>
