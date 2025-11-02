@@ -230,13 +230,14 @@
       <artifactId>jakarta.xml.bind-api</artifactId>
     </dependency>
 
-    <!-- Java 21 compatibility: JAXB runtime implementation for test scope.
+    <!-- Java 21 compatibility: JAXB runtime implementation for runtime scope.
          The jaxb-runtime version is inherited from parent POM (4.0.3) which provides
-         Jakarta XML Binding support required for Java 21 compatibility. -->
+         Jakarta XML Binding support required for Java 21 compatibility.
+         Runtime scope is required for LocalizationStatus and other classes using JAXB annotations. -->
     <dependency>
       <groupId>org.glassfish.jaxb</groupId>
       <artifactId>jaxb-runtime</artifactId>
-      <scope>test</scope>
+      <scope>runtime</scope>
     </dependency>
     
     <!-- Java 21 compatibility: Jersey 2.x backward compatibility bridge.
