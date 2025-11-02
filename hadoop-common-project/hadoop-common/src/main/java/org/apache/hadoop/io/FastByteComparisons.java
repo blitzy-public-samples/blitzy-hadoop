@@ -17,14 +17,13 @@
  */
 package org.apache.hadoop.io;
 
-import java.lang.reflect.Field;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.security.AccessController;
-import java.security.PrivilegedAction;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import sun.misc.Unsafe;
 
 import org.apache.hadoop.thirdparty.com.google.common.primitives.UnsignedBytes;
 
@@ -58,10 +57,10 @@ abstract class FastByteComparisons {
 
   /**
    * Provides a lexicographical comparer implementation; either a Java
-   * implementation or a faster implementation based on {@link Unsafe}.
+   * implementation or a faster implementation based on VarHandle.
    *
    * <p>Uses reflection to gracefully fall back to the Java implementation if
-   * {@code Unsafe} isn't available.
+   * VarHandle-based comparison isn't available.
    */
   private static class LexicographicalComparerHolder {
     static final String UNSAFE_COMPARER_NAME =
@@ -131,35 +130,27 @@ abstract class FastByteComparisons {
     private enum UnsafeComparer implements Comparer<byte[]> {
       INSTANCE;
 
-      static final Unsafe theUnsafe;
+      /**
+       * VarHandle for reading long values from byte arrays.
+       * Replaces sun.misc.Unsafe for Java 21 compatibility.
+       */
+      static final VarHandle LONG_ARRAY_VIEW;
 
       /** The offset to the first element in a byte array. */
       static final int BYTE_ARRAY_BASE_OFFSET;
 
       static {
-        theUnsafe = (Unsafe) AccessController.doPrivileged(
-            new PrivilegedAction<Object>() {
-              @Override
-              public Object run() {
-                try {
-                  Field f = Unsafe.class.getDeclaredField("theUnsafe");
-                  f.setAccessible(true);
-                  return f.get(null);
-                } catch (NoSuchFieldException e) {
-                  // It doesn't matter what we throw;
-                  // it's swallowed in getBestComparer().
-                  throw new Error();
-                } catch (IllegalAccessException e) {
-                  throw new Error();
-                }
-              }
-            });
-
-        BYTE_ARRAY_BASE_OFFSET = theUnsafe.arrayBaseOffset(byte[].class);
-
-        // sanity check - this should never fail
-        if (theUnsafe.arrayIndexScale(byte[].class) != 1) {
-          throw new AssertionError();
+        try {
+          // Initialize VarHandle for byte array access with native byte order
+          LONG_ARRAY_VIEW = MethodHandles.byteArrayViewVarHandle(
+              long[].class, ByteOrder.nativeOrder());
+          
+          // VarHandle uses direct array indexing, no base offset needed
+          BYTE_ARRAY_BASE_OFFSET = 0;
+        } catch (Throwable t) {
+          // It doesn't matter what we throw;
+          // it's swallowed in getBestComparer().
+          throw new Error("Failed to initialize VarHandle for byte array comparison", t);
         }
       }
 
@@ -207,8 +198,8 @@ abstract class FastByteComparisons {
          * On the other hand, it is substantially faster on 64-bit.
          */
         for (i = 0; i < strideLimit; i += stride) {
-          long lw = theUnsafe.getLong(buffer1, offset1Adj + (long) i);
-          long rw = theUnsafe.getLong(buffer2, offset2Adj + (long) i);
+          long lw = (long) LONG_ARRAY_VIEW.get(buffer1, offset1Adj + i);
+          long rw = (long) LONG_ARRAY_VIEW.get(buffer2, offset2Adj + i);
 
           if (lw != rw) {
             if (!littleEndian) {
