@@ -225,6 +225,12 @@
       <groupId>org.glassfish.jersey.media</groupId>
       <artifactId>jersey-media-json-jettison</artifactId>
     </dependency>
+    <!-- OLD javax.xml.bind for Jersey 2.x compatibility (JettisonJaxbContext requires javax namespace) -->
+    <dependency>
+      <groupId>javax.xml.bind</groupId>
+      <artifactId>jaxb-api</artifactId>
+      <version>2.3.1</version>
+    </dependency>
   </dependencies>
 
   <profiles>
