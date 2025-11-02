@@ -21,6 +21,38 @@
     <version>3.5.0-SNAPSHOT</version>
     <relativePath>../hadoop-project</relativePath>
   </parent>
+  
+  <!--
+    Java 21 Migration: This aggregator POM inherits all Java 21 build configuration
+    through Maven parent mechanism from hadoop-project POM. No explicit property
+    overrides or plugin version declarations are required.
+    
+    Inherited Java 21 Configuration:
+    - javac.version=21 (compilation target for all YARN modules)
+    - maven.compiler.release=21 (ensures Java 21 bytecode generation)
+    - enforced.java.version=[21,) (Maven Enforcer validates Java 21 minimum)
+    - maven-compiler-plugin 3.11.0 (Java 21 compilation support)
+    - maven-surefire-plugin 3.1.2 (Java 21 test execution support)
+    - maven-javadoc-plugin 3.5.0 (Java 21 javadoc generation)
+    - extraJavaTestArgs with --add-opens flags (test reflection access for Java 21)
+    
+    Module Propagation:
+    The child module 'hadoop-yarn' and all its descendants automatically inherit
+    these Java 21 settings through the parent chain:
+    hadoop-yarn-project → hadoop-project → root pom.xml
+    
+    This includes all YARN sub-modules:
+    - hadoop-yarn-api (JAXB namespace migration javax→jakarta)
+    - hadoop-yarn-common (JAXB namespace migration javax→jakarta)
+    - hadoop-yarn-server-* (inherits Java 21 compilation settings)
+    - hadoop-yarn-applications-* (inherits Java 21 compilation settings)
+    - hadoop-yarn-client (inherits Java 21 compilation settings)
+    - hadoop-yarn-ui (inherits Java 21 compilation settings)
+    - hadoop-yarn-csi (inherits Java 21 compilation settings)
+    - hadoop-yarn-registry (inherits Java 21 compilation settings)
+    - hadoop-yarn-site (inherits Java 21 compilation settings)
+  -->
+  
   <artifactId>hadoop-yarn-project</artifactId>
   <version>3.5.0-SNAPSHOT</version>
   <packaging>pom</packaging>
