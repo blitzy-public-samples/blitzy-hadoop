@@ -191,9 +191,10 @@
       <groupId>com.fasterxml.jackson.core</groupId>
       <artifactId>jackson-databind</artifactId>
     </dependency>
+    <!-- Jackson module for Jakarta XML Binding annotations (Java 21 compatibility) -->
     <dependency>
       <groupId>com.fasterxml.jackson.module</groupId>
-      <artifactId>jackson-module-jaxb-annotations</artifactId>
+      <artifactId>jackson-module-jakarta-xmlbind-annotations</artifactId>
     </dependency>
     <dependency>
       <groupId>com.fasterxml.jackson.jaxrs</groupId>
