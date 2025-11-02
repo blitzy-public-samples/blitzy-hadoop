@@ -22,11 +22,10 @@ import java.util.Set;
 import java.util.HashSet;
 import java.util.Arrays;
 
-import org.glassfish.jersey.jettison.JettisonJaxbContext;
 import javax.inject.Singleton;
 import javax.ws.rs.ext.ContextResolver;
 import javax.ws.rs.ext.Provider;
-import javax.xml.bind.JAXBContext;
+import jakarta.xml.bind.JAXBContext;
 
 import org.apache.hadoop.yarn.server.nodemanager.webapp.dao.AppInfo;
 import org.apache.hadoop.yarn.server.nodemanager.webapp.dao.AppsInfo;
@@ -54,9 +53,8 @@ public class JAXBContextResolver implements ContextResolver<JAXBContext> {
 
   public JAXBContextResolver() throws Exception {
     this.types = new HashSet<>(Arrays.asList(cTypes));
-    // sets the json configuration so that the json output looks like
-    // the xml output
-    this.context = new JettisonJaxbContext(cTypes);
+    // Use standard Jakarta JAXBContext for Java 21 compatibility
+    this.context = JAXBContext.newInstance(cTypes);
   }
 
   @Override

@@ -18,7 +18,6 @@
 
 package org.apache.hadoop.yarn.server.resourcemanager.webapp;
 
-import org.glassfish.jersey.jettison.JettisonJaxbContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -32,7 +31,7 @@ import javax.inject.Inject;
 import javax.inject.Singleton;
 import javax.ws.rs.ext.ContextResolver;
 import javax.ws.rs.ext.Provider;
-import javax.xml.bind.JAXBContext;
+import jakarta.xml.bind.JAXBContext;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
@@ -155,8 +154,9 @@ public class JAXBContextResolver implements ContextResolver<JAXBContext> {
         .toArray(new Class[finalRootUnwrappedTypesList.size()]);
 
     this.typesContextMap = new HashMap<>();
-    context = new JettisonJaxbContext(finalcTypes);
-    unWrappedRootContext = new JettisonJaxbContext(finalRootUnwrappedTypes);
+    // Use standard Jakarta JAXBContext for Java 21 compatibility
+    context = JAXBContext.newInstance(finalcTypes);
+    unWrappedRootContext = JAXBContext.newInstance(finalRootUnwrappedTypes);
     for (Class type : finalcTypes) {
       typesContextMap.put(type, context);
     }

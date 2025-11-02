@@ -25,7 +25,7 @@ import java.util.Set;
 import javax.inject.Singleton;
 import javax.ws.rs.ext.ContextResolver;
 import javax.ws.rs.ext.Provider;
-import javax.xml.bind.JAXBContext;
+import jakarta.xml.bind.JAXBContext;
 
 import org.apache.hadoop.yarn.server.webapp.dao.AppAttemptInfo;
 import org.apache.hadoop.yarn.server.webapp.dao.AppAttemptsInfo;
@@ -33,8 +33,6 @@ import org.apache.hadoop.yarn.server.webapp.dao.AppInfo;
 import org.apache.hadoop.yarn.server.webapp.dao.AppsInfo;
 import org.apache.hadoop.yarn.server.webapp.dao.ContainerInfo;
 import org.apache.hadoop.yarn.server.webapp.dao.ContainersInfo;
-
-import org.glassfish.jersey.jettison.JettisonJaxbContext;
 
 @Singleton
 @Provider
@@ -51,7 +49,8 @@ public class JAXBContextResolver implements ContextResolver<JAXBContext> {
 
   public JAXBContextResolver() throws Exception {
     this.types = new HashSet<>(Arrays.asList(cTypes));
-    this.context = new JettisonJaxbContext(cTypes);
+    // Use standard Jakarta JAXBContext for Java 21 compatibility
+    this.context = JAXBContext.newInstance(cTypes);
   }
 
   @Override
