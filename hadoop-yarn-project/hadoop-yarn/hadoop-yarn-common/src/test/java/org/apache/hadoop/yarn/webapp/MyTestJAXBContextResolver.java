@@ -23,7 +23,7 @@ import java.util.HashSet;
 import java.util.Set;
 import javax.ws.rs.ext.ContextResolver;
 import javax.ws.rs.ext.Provider;
-import jakarta.xml.bind.JAXBContext;
+import javax.xml.bind.JAXBContext;
 
 import javax.inject.Singleton;
 import org.glassfish.jersey.jettison.JettisonJaxbContext;
