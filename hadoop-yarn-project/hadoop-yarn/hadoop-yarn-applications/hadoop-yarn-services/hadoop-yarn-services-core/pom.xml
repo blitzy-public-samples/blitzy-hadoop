@@ -230,6 +230,20 @@
       <artifactId>jakarta.xml.bind-api</artifactId>
     </dependency>
 
+    <!-- Java 21 compatibility: Jersey 2.x requires javax.xml.bind API and implementation for XML providers -->
+    <dependency>
+      <groupId>javax.xml.bind</groupId>
+      <artifactId>jaxb-api</artifactId>
+      <version>2.3.1</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.glassfish.jaxb</groupId>
+      <artifactId>jaxb-runtime</artifactId>
+      <version>2.3.1</version>
+      <scope>test</scope>
+    </dependency>
+
     <dependency>
       <groupId>org.yaml</groupId>
       <artifactId>snakeyaml</artifactId>
