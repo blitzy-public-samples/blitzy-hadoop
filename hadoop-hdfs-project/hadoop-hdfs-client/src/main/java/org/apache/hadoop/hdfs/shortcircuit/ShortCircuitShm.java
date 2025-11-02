@@ -19,7 +19,9 @@ package org.apache.hadoop.hdfs.shortcircuit;
 
 import java.io.FileInputStream;
 import java.io.IOException;
-import java.lang.reflect.Field;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.lang.invoke.VarHandle;
 import java.util.BitSet;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
@@ -37,8 +39,6 @@ import org.apache.hadoop.util.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import sun.misc.Unsafe;
-
 import org.apache.hadoop.util.Preconditions;
 import org.apache.hadoop.thirdparty.com.google.common.collect.ComparisonChain;
 import org.apache.hadoop.thirdparty.com.google.common.primitives.Ints;
@@ -54,18 +54,11 @@ public class ShortCircuitShm {
 
   protected static final int BYTES_PER_SLOT = 64;
 
-  private static final Unsafe unsafe = safetyDance();
-
-  private static Unsafe safetyDance() {
-    try {
-      Field f = Unsafe.class.getDeclaredField("theUnsafe");
-      f.setAccessible(true);
-      return (Unsafe)f.get(null);
-    } catch (Throwable e) {
-      LOG.error("failed to load misc.Unsafe", e);
-    }
-    return null;
-  }
+  /**
+   * VarHandle for atomic/volatile access to 64-bit slot control words in shared memory.
+   * Replaces sun.misc.Unsafe for Java 21 compatibility.
+   */
+  private static final VarHandle LONG_HANDLE = ValueLayout.JAVA_LONG_UNALIGNED.varHandle();
 
   /**
    * Calculate the usable size of a shared memory segment.
@@ -314,34 +307,32 @@ public class ShortCircuitShm {
      * Clear the slot.
      */
     void clear() {
-      unsafe.putLongVolatile(null, this.slotAddress, 0);
+      LONG_HANDLE.setVolatile(memorySegment, this.slotAddress - baseAddress, 0L);
     }
 
     private boolean isSet(long flag) {
-      long prev = unsafe.getLongVolatile(null, this.slotAddress);
+      long prev = (long) LONG_HANDLE.getVolatile(memorySegment, this.slotAddress - baseAddress);
       return (prev & flag) != 0;
     }
 
     private void setFlag(long flag) {
       long prev;
       do {
-        prev = unsafe.getLongVolatile(null, this.slotAddress);
+        prev = (long) LONG_HANDLE.getVolatile(memorySegment, this.slotAddress - baseAddress);
         if ((prev & flag) != 0) {
           return;
         }
-      } while (!unsafe.compareAndSwapLong(null, this.slotAddress,
-                  prev, prev | flag));
+      } while (!LONG_HANDLE.compareAndSet(memorySegment, this.slotAddress - baseAddress, prev, prev | flag));
     }
 
     private void clearFlag(long flag) {
       long prev;
       do {
-        prev = unsafe.getLongVolatile(null, this.slotAddress);
+        prev = (long) LONG_HANDLE.getVolatile(memorySegment, this.slotAddress - baseAddress);
         if ((prev & flag) == 0) {
           return;
         }
-      } while (!unsafe.compareAndSwapLong(null, this.slotAddress,
-                  prev, prev & (~flag)));
+      } while (!LONG_HANDLE.compareAndSet(memorySegment, this.slotAddress - baseAddress, prev, prev & (~flag)));
     }
 
     public boolean isValid() {
@@ -369,7 +360,7 @@ public class ShortCircuitShm {
     }
 
     public boolean isAnchored() {
-      long prev = unsafe.getLongVolatile(null, this.slotAddress);
+      long prev = (long) LONG_HANDLE.getVolatile(memorySegment, this.slotAddress - baseAddress);
       // Slot is no longer valid.
       return (prev & VALID_FLAG) != 0 && ((prev & 0x7fffffff) != 0);
     }
@@ -385,7 +376,7 @@ public class ShortCircuitShm {
     public boolean addAnchor() {
       long prev;
       do {
-        prev = unsafe.getLongVolatile(null, this.slotAddress);
+        prev = (long) LONG_HANDLE.getVolatile(memorySegment, this.slotAddress - baseAddress);
         if ((prev & VALID_FLAG) == 0) {
           // Slot is no longer valid.
           return false;
@@ -398,8 +389,7 @@ public class ShortCircuitShm {
           // Too many other threads have anchored the slot (2 billion?)
           return false;
         }
-      } while (!unsafe.compareAndSwapLong(null, this.slotAddress,
-                  prev, prev + 1));
+      } while (!LONG_HANDLE.compareAndSet(memorySegment, this.slotAddress - baseAddress, prev, prev + 1));
       return true;
     }
 
@@ -409,12 +399,11 @@ public class ShortCircuitShm {
     public void removeAnchor() {
       long prev;
       do {
-        prev = unsafe.getLongVolatile(null, this.slotAddress);
+        prev = (long) LONG_HANDLE.getVolatile(memorySegment, this.slotAddress - baseAddress);
         Preconditions.checkState((prev & 0x7fffffff) != 0,
             "Tried to remove anchor for slot " + slotAddress +", which was " +
             "not anchored.");
-      } while (!unsafe.compareAndSwapLong(null, this.slotAddress,
-                  prev, prev - 1));
+      } while (!LONG_HANDLE.compareAndSet(memorySegment, this.slotAddress - baseAddress, prev, prev - 1));
     }
 
     @Override
@@ -437,6 +426,12 @@ public class ShortCircuitShm {
    * The mmapped length of the shared memory segment
    */
   private final int mmappedLength;
+
+  /**
+   * MemorySegment providing bounds-checked access to POSIX mmap'd shared memory for short-circuit read slots.
+   * Replaces absolute memory addressing with segment-relative offsets for Java 21 compatibility.
+   */
+  private final MemorySegment memorySegment;
 
   /**
    * The slots associated with this shared memory segment.
@@ -473,15 +468,11 @@ public class ShortCircuitShm {
       throw new UnsupportedOperationException(
           "DfsClientShm is not yet implemented for Windows.");
     }
-    if (unsafe == null) {
-      throw new UnsupportedOperationException(
-          "can't use DfsClientShm because we failed to " +
-          "load misc.Unsafe.");
-    }
     this.shmId = shmId;
     this.mmappedLength = getUsableLength(stream);
     this.baseAddress = POSIX.mmap(stream.getFD(),
         POSIX.MMAP_PROT_READ | POSIX.MMAP_PROT_WRITE, true, mmappedLength);
+    this.memorySegment = MemorySegment.ofAddress(baseAddress).reinterpret(mmappedLength);
     this.slots = new Slot[mmappedLength / BYTES_PER_SLOT];
     this.allocatedSlots = new BitSet(slots.length);
     LOG.trace("creating {}(shmId={}, mmappedLength={}, baseAddress={}, "
