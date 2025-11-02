@@ -39,8 +39,8 @@ import java.util.concurrent.Callable;
 
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
-import jakarta.xml.bind.JAXBContext;
-import jakarta.xml.bind.Marshaller;
+import javax.xml.bind.JAXBContext;
+import javax.xml.bind.Marshaller;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
