@@ -230,7 +230,20 @@
       <artifactId>jakarta.xml.bind-api</artifactId>
     </dependency>
 
-    <!-- Java 21 compatibility: Jersey 2.x requires javax.xml.bind API and implementation for XML providers -->
+    <!-- Java 21 compatibility: JAXB runtime implementations for test scope.
+         
+         Both jakarta and javax JAXB runtimes are needed:
+         1. jakarta.xml.bind (4.0.x) for application code using jakarta namespace
+         2. javax.xml.bind (2.3.x) for Jersey 2.x which hasn't migrated to jakarta yet
+         
+         Jersey 2.46 (used by test infrastructure via MiniYARNCluster) still uses 
+         javax.xml.bind namespace. This dual-dependency approach supports both
+         during the Java 21 migration transition period. -->
+    <dependency>
+      <groupId>org.glassfish.jaxb</groupId>
+      <artifactId>jaxb-runtime</artifactId>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>javax.xml.bind</groupId>
       <artifactId>jaxb-api</artifactId>
