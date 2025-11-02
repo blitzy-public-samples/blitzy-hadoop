@@ -23,18 +23,18 @@ import java.util.HashSet;
 import java.util.Set;
 import javax.ws.rs.ext.ContextResolver;
 import javax.ws.rs.ext.Provider;
-import javax.xml.bind.JAXBContext;
 
 import javax.inject.Singleton;
 import org.glassfish.jersey.jettison.JettisonJaxbContext;
 
 import org.apache.hadoop.yarn.webapp.MyTestWebService.MyInfo;
 
+// Jersey 2.x still uses javax.xml.bind, use fully qualified name for compatibility
 @Singleton
 @Provider
-public class MyTestJAXBContextResolver implements ContextResolver<JAXBContext> {
+public class MyTestJAXBContextResolver implements ContextResolver<javax.xml.bind.JAXBContext> {
 
-  private JAXBContext context;
+  private javax.xml.bind.JAXBContext context;
   private final Set<Class> types;
 
   // you have to specify all the dao classes here
@@ -46,7 +46,7 @@ public class MyTestJAXBContextResolver implements ContextResolver<JAXBContext> {
   }
 
   @Override
-  public JAXBContext getContext(Class<?> objectType) {
+  public javax.xml.bind.JAXBContext getContext(Class<?> objectType) {
     return (types.contains(objectType)) ? context : null;
   }
 }

@@ -29,7 +29,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
-import jakarta.xml.bind.JAXBException;
+// Jersey 2.x uses javax.xml.bind, not jakarta
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.ha.HAServiceProtocol;
@@ -108,7 +108,7 @@ public class TestFederationRMStateStoreService {
   private MockRM mockRM;
 
   @BeforeEach
-  public void setUp() throws IOException, YarnException, JAXBException {
+  public void setUp() throws IOException, YarnException, javax.xml.bind.JAXBException {
     conf = new YarnConfiguration();
     this.jettisonJaxbContext = new JettisonJaxbContext(ClusterMetricsInfo.class);
     this.jsonUnmarshaller = jettisonJaxbContext.createJsonUnmarshaller();
@@ -200,7 +200,7 @@ public class TestFederationRMStateStoreService {
   }
 
   private void checkClusterMetricsInfo(String capability, int numNodes)
-      throws JAXBException {
+      throws javax.xml.bind.JAXBException {
     ClusterMetricsInfo clusterMetricsInfo = jsonUnmarshaller.unmarshalFromJSON(
         new StringReader(capability), ClusterMetricsInfo.class);
     assertEquals(numNodes, clusterMetricsInfo.getTotalNodes());

@@ -21,7 +21,7 @@ package org.apache.hadoop.mapreduce.v2.app.webapp.dao;
 import org.apache.hadoop.mapreduce.v2.api.records.TaskType;
 import org.apache.hadoop.mapreduce.v2.app.job.TaskAttempt;
 
-import javax.xml.bind.annotation.XmlRootElement;
+import jakarta.xml.bind.annotation.XmlRootElement;
 
 @XmlRootElement(name = "taskAttempt")
 public class MapTaskAttemptInfo extends TaskAttemptInfo {

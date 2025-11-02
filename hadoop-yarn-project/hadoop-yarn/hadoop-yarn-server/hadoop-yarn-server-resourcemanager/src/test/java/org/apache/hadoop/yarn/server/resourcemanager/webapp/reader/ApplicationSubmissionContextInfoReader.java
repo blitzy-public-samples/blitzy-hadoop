@@ -27,7 +27,7 @@ import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.MultivaluedMap;
 import javax.ws.rs.ext.MessageBodyReader;
 import javax.ws.rs.ext.Provider;
-import jakarta.xml.bind.JAXBException;
+// Jersey 2.x uses javax.xml.bind, not jakarta
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.annotation.Annotation;
@@ -50,7 +50,7 @@ public class ApplicationSubmissionContextInfoReader
       JettisonJaxbContext jettisonJaxbContext = new JettisonJaxbContext(
           ApplicationSubmissionContextInfo.class);
       jsonUnmarshaller = jettisonJaxbContext.createJsonUnmarshaller();
-    } catch (JAXBException e) {
+    } catch (javax.xml.bind.JAXBException e) {
     }
   }
 
@@ -68,7 +68,7 @@ public class ApplicationSubmissionContextInfoReader
     try {
       return jsonUnmarshaller.unmarshalFromJSON(entityStream,
           ApplicationSubmissionContextInfo.class);
-    } catch (JAXBException e) {
+    } catch (javax.xml.bind.JAXBException e) {
       throw new IOException(e);
     }
   }

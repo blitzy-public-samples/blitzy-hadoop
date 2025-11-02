@@ -36,7 +36,7 @@ import java.util.stream.Collectors;
 import javax.ws.rs.client.WebTarget;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
-import jakarta.xml.bind.JAXBException;
+// Jersey 2.x uses javax.xml.bind, not jakarta
 import jakarta.xml.bind.Marshaller;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
@@ -367,10 +367,12 @@ public final class TestWebServiceUtil {
     return stringWriter.toString();
   }
 
-  public static String toXml(Object obj, Class<?> klass) throws JAXBException {
+  // Jersey 2.x still uses javax.xml.bind, use fully qualified exception name for compatibility
+  public static String toXml(Object obj, Class<?> klass) throws javax.xml.bind.JAXBException {
     StringWriter stringWriter = new StringWriter();
     JettisonJaxbContext jettisonJaxbContext = new JettisonJaxbContext(klass);
-    Marshaller marshaller = jettisonJaxbContext.createMarshaller();
+    // Jersey 2.x still uses javax.xml.bind, use fully qualified name for compatibility
+    javax.xml.bind.Marshaller marshaller = jettisonJaxbContext.createMarshaller();
     marshaller.marshal(obj, stringWriter);
     return stringWriter.toString();
   }

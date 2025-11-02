@@ -55,7 +55,7 @@ import javax.ws.rs.client.WebTarget;
 import javax.ws.rs.core.Application;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
-import jakarta.xml.bind.JAXBException;
+// Jersey 2.x uses javax.xml.bind, not jakarta
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.parsers.ParserConfigurationException;
@@ -164,7 +164,7 @@ public class TestRMWebServicesAppsModification extends JerseyTestBase {
     try {
       JettisonJaxbContext jettisonJaxbContext = new JettisonJaxbContext(AppState.class);
       APP_STATE_WRITER = jettisonJaxbContext.createJsonMarshaller();
-    } catch (JAXBException e) {
+    } catch (javax.xml.bind.JAXBException e) {
       throw new RuntimeException(e);
     }
   }
@@ -174,7 +174,7 @@ public class TestRMWebServicesAppsModification extends JerseyTestBase {
     try {
       JettisonJaxbContext jettisonJaxbContext = new JettisonJaxbContext(AppPriority.class);
       APP_PRIORITY_WRITER = jettisonJaxbContext.createJsonMarshaller();
-    } catch (JAXBException e) {
+    } catch (javax.xml.bind.JAXBException e) {
       throw new RuntimeException(e);
     }
   }
@@ -184,7 +184,7 @@ public class TestRMWebServicesAppsModification extends JerseyTestBase {
     try {
       JettisonJaxbContext jettisonJaxbContext = new JettisonJaxbContext(AppQueue.class);
       APP_QUEUE_WRITER = jettisonJaxbContext.createJsonMarshaller();
-    } catch (JAXBException e) {
+    } catch (javax.xml.bind.JAXBException e) {
       throw new RuntimeException(e);
     }
   }
@@ -194,7 +194,7 @@ public class TestRMWebServicesAppsModification extends JerseyTestBase {
     try {
       JettisonJaxbContext jettisonJaxbContext = new JettisonJaxbContext(AppTimeoutInfo.class);
       APP_TIMEOUT_WRITER = jettisonJaxbContext.createJsonMarshaller();
-    } catch (JAXBException e) {
+    } catch (javax.xml.bind.JAXBException e) {
       throw new RuntimeException(e);
     }
   }

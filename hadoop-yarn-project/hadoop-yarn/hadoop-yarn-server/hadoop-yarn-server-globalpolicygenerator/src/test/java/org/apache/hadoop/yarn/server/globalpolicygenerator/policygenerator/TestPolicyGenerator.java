@@ -59,7 +59,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
-import jakarta.xml.bind.JAXBException;
+// Jersey 2.x uses javax.xml.bind, not jakarta
 import java.io.IOException;
 import java.io.StringReader;
 import java.net.InetSocketAddress;
@@ -109,7 +109,7 @@ public class TestPolicyGenerator {
   }
 
   @BeforeEach
-  public void setUp() throws IOException, YarnException, JAXBException {
+  public void setUp() throws IOException, YarnException, javax.xml.bind.JAXBException {
     subClusterIds = new ArrayList<>();
     subClusterInfos = new HashMap<>();
     clusterInfos = new HashMap<>();
@@ -162,7 +162,7 @@ public class TestPolicyGenerator {
   }
 
   private <T> T readJSON(String pathname, Class<T> classy)
-      throws IOException, JAXBException {
+      throws IOException, javax.xml.bind.JAXBException {
     JettisonJaxbContext jaxbContext = new JettisonJaxbContext(JettisonConfig.DEFAULT, classy);
     String contents = new String(Files.readAllBytes(Paths.get(pathname)));
     JettisonUnmarshaller unmarshaller = jaxbContext.createJsonUnmarshaller();

@@ -26,7 +26,7 @@ import javax.inject.Singleton;
 
 import javax.ws.rs.ext.ContextResolver;
 import javax.ws.rs.ext.Provider;
-import javax.xml.bind.JAXBContext;
+// Jersey 2.x uses javax.xml.bind, not jakarta
 
 import org.apache.hadoop.mapreduce.v2.app.webapp.dao.AMAttemptInfo;
 import org.apache.hadoop.mapreduce.v2.app.webapp.dao.AMAttemptsInfo;
@@ -52,9 +52,9 @@ import org.apache.hadoop.yarn.webapp.RemoteExceptionData;
 
 @Singleton
 @Provider
-public class JAXBContextResolver implements ContextResolver<JAXBContext> {
+public class JAXBContextResolver implements ContextResolver<javax.xml.bind.JAXBContext> {
 
-  private final Map<Class, JAXBContext> typesContextMap;
+  private final Map<Class, javax.xml.bind.JAXBContext> typesContextMap;
 
   // you have to specify all the dao classes here
   private final Class[] cTypes = {AMAttemptInfo.class, AMAttemptsInfo.class,
@@ -68,8 +68,9 @@ public class JAXBContextResolver implements ContextResolver<JAXBContext> {
   private final Class[] rootUnwrappedTypes = {JobTaskAttemptState.class};
 
   public JAXBContextResolver() throws Exception {
-    JAXBContext context;
-    JAXBContext unWrappedRootContext;
+    // Jersey 2.x uses javax.xml.bind, not jakarta
+    javax.xml.bind.JAXBContext context;
+    javax.xml.bind.JAXBContext unWrappedRootContext;
 
     this.typesContextMap = new HashMap<>();
     context = new JettisonJaxbContext(cTypes);
@@ -83,7 +84,7 @@ public class JAXBContextResolver implements ContextResolver<JAXBContext> {
   }
 
   @Override
-  public JAXBContext getContext(Class<?> objectType) {
+  public javax.xml.bind.JAXBContext getContext(Class<?> objectType) {
     return typesContextMap.get(objectType);
   }
 }

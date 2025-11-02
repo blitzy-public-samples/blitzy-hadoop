@@ -27,7 +27,7 @@ import java.util.Set;
 
 import javax.ws.rs.ext.ContextResolver;
 import javax.ws.rs.ext.Provider;
-import javax.xml.bind.JAXBContext;
+// Jersey 2.x uses javax.xml.bind, not jakarta
 
 import org.apache.hadoop.mapreduce.v2.app.webapp.dao.ConfInfo;
 import org.apache.hadoop.mapreduce.v2.app.webapp.dao.CounterGroupInfo;
@@ -52,9 +52,9 @@ import org.apache.hadoop.yarn.webapp.RemoteExceptionData;
 
 @Singleton
 @Provider
-public class JAXBContextResolver implements ContextResolver<JAXBContext> {
+public class JAXBContextResolver implements ContextResolver<javax.xml.bind.JAXBContext> {
 
-  private JAXBContext context;
+  private javax.xml.bind.JAXBContext context;
   private final Set<Class> types;
 
   // you have to specify all the dao classes here
@@ -73,7 +73,7 @@ public class JAXBContextResolver implements ContextResolver<JAXBContext> {
   }
 
   @Override
-  public JAXBContext getContext(Class<?> objectType) {
+  public javax.xml.bind.JAXBContext getContext(Class<?> objectType) {
     return (types.contains(objectType)) ? context : null;
   }
 }

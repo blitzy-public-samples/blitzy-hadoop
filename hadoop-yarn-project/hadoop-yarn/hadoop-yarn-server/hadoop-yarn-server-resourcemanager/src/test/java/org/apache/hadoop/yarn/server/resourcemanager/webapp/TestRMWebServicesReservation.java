@@ -45,7 +45,7 @@ import javax.ws.rs.client.WebTarget;
 import javax.ws.rs.core.Application;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
-import jakarta.xml.bind.JAXBException;
+// Jersey 2.x uses javax.xml.bind, not jakarta
 
 import org.apache.commons.io.FileUtils;
 import org.apache.hadoop.conf.Configuration;
@@ -118,7 +118,7 @@ public class TestRMWebServicesReservation extends JerseyTestBase {
       JettisonJaxbContext jettisonJaxbContext = new JettisonJaxbContext(
           ReservationSubmissionRequestInfo.class);
       reservationSubmissionRequestInfoReader = jettisonJaxbContext.createJsonUnmarshaller();
-    } catch (JAXBException e) {
+    } catch (javax.xml.bind.JAXBException e) {
       throw new RuntimeException(e);
     }
   }
@@ -1134,7 +1134,7 @@ public class TestRMWebServicesReservation extends JerseyTestBase {
       JettisonJaxbContext jettisonJaxbContext = new JettisonJaxbContext(
           ReservationUpdateRequestInfo.class);
       reservationUpdateRequestInfoReader = jettisonJaxbContext.createJsonUnmarshaller();
-    } catch (JAXBException e) {
+    } catch (javax.xml.bind.JAXBException e) {
       throw new RuntimeException(e);
     }
 
@@ -1192,7 +1192,7 @@ public class TestRMWebServicesReservation extends JerseyTestBase {
       JettisonJaxbContext jettisonJaxbContext = new JettisonJaxbContext(
           ReservationDeleteRequestInfo.class);
       reader = jettisonJaxbContext.createJsonUnmarshaller();
-    } catch (JAXBException e) {
+    } catch (javax.xml.bind.JAXBException e) {
       throw new RuntimeException(e);
     }
 

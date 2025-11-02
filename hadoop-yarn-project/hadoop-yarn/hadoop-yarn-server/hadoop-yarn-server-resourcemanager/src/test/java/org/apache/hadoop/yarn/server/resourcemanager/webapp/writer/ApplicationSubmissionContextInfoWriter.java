@@ -27,8 +27,6 @@ import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.MultivaluedMap;
 import javax.ws.rs.ext.MessageBodyWriter;
 import javax.ws.rs.ext.Provider;
-import jakarta.xml.bind.JAXBException;
-import jakarta.xml.bind.Marshaller;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.StringWriter;
@@ -47,7 +45,8 @@ public class ApplicationSubmissionContextInfoWriter
     implements MessageBodyWriter<ApplicationSubmissionContextInfo> {
 
   private JettisonMarshaller jettisonMarshaller;
-  private Marshaller marshaller;
+  // Jersey 2.x still uses javax.xml.bind, use fully qualified name for compatibility
+  private javax.xml.bind.Marshaller marshaller;
 
   public ApplicationSubmissionContextInfoWriter() {
     try {
@@ -55,7 +54,7 @@ public class ApplicationSubmissionContextInfoWriter
           ApplicationSubmissionContextInfo.class);
       jettisonMarshaller = jettisonJaxbContext.createJsonMarshaller();
       marshaller = jettisonJaxbContext.createMarshaller();
-    } catch (JAXBException e) {
+    } catch (javax.xml.bind.JAXBException e) {
     }
   }
 
@@ -82,7 +81,7 @@ public class ApplicationSubmissionContextInfoWriter
         entityStream.write(stringWriter.toString().getBytes(StandardCharsets.UTF_8));
       }
 
-    } catch (JAXBException e) {
+    } catch (javax.xml.bind.JAXBException e) {
       throw new IOException(e);
     }
   }
