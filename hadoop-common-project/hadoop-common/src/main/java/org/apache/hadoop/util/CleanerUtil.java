@@ -37,11 +37,11 @@ import static java.lang.invoke.MethodHandles.guardWithTest;
 import static java.lang.invoke.MethodType.methodType;
 
 /**
- * sun.misc.Cleaner has moved in OpenJDK 9 and
- * sun.misc.Unsafe#invokeCleaner(ByteBuffer) is the replacement.
- * This class is a hack to use sun.misc.Cleaner in Java 8 and
- * use the replacement in Java 9+.
- * This implementation is inspired by LUCENE-6989.
+ * sun.misc.Cleaner has moved to jdk.internal.ref.Cleaner in OpenJDK 9+.
+ * This class provides Java version-compatible ByteBuffer cleanup by attempting
+ * Java 9+ jdk.internal.ref.Cleaner first, falling back to sun.misc.Unsafe#invokeCleaner,
+ * and finally using sun.misc.Cleaner for Java 8 compatibility.
+ * This implementation is inspired by LUCENE-6989 and adapted for Java 21.
  */
 @InterfaceAudience.Private
 @InterfaceStability.Unstable
@@ -90,7 +90,52 @@ public final class CleanerUtil {
     final MethodHandles.Lookup lookup = MethodHandles.lookup();
     try {
       try {
-        // *** sun.misc.Unsafe unmapping (Java 9+) ***
+        // *** Java 9+ jdk.internal.ref.Cleaner unmapping (preferred for Java 21) ***
+        final Class<?> directBufferClass =
+            Class.forName("java.nio.DirectByteBuffer");
+
+        final Method m = directBufferClass.getMethod("cleaner");
+        m.setAccessible(true);
+        final MethodHandle directBufferCleanerMethod = lookup.unreflect(m);
+        
+        // Try to use jdk.internal.ref.Cleaner (Java 9+)
+        final Class<?> cleanerClass = Class.forName("jdk.internal.ref.Cleaner");
+        
+        /*
+         * "Compile" a MethodHandle that basically is equivalent
+         * to the following code:
+         *
+         * void unmapper(ByteBuffer byteBuffer) {
+         *   jdk.internal.ref.Cleaner cleaner =
+         *       ((java.nio.DirectByteBuffer) byteBuffer).cleaner();
+         *   if (Objects.nonNull(cleaner)) {
+         *     cleaner.clean();
+         *   } else {
+         *     // the noop is needed because MethodHandles#guardWithTest
+         *     // always needs ELSE
+         *     noop(cleaner);
+         *   }
+         * }
+         */
+        final MethodHandle cleanMethod = lookup.findVirtual(
+            cleanerClass, "clean", methodType(void.class));
+        final MethodHandle nonNullTest = lookup.findStatic(Objects.class,
+            "nonNull", methodType(boolean.class, Object.class))
+            .asType(methodType(boolean.class, cleanerClass));
+        final MethodHandle noop = dropArguments(
+            constant(Void.class, null).asType(methodType(void.class)),
+            0, cleanerClass);
+        final MethodHandle unmapper = filterReturnValue(
+            directBufferCleanerMethod,
+            guardWithTest(nonNullTest, cleanMethod, noop))
+            .asType(methodType(void.class, ByteBuffer.class));
+        return newBufferCleaner(directBufferClass, unmapper);
+      } catch (ClassNotFoundException | NoSuchMethodException e) {
+        // jdk.internal.ref.Cleaner not available, try Unsafe approach
+      }
+      
+      try {
+        // *** sun.misc.Unsafe unmapping (Java 9+ fallback) ***
         final Class<?> unsafeClass = Class.forName("sun.misc.Unsafe");
         // first check if Unsafe has the right method, otherwise we can
         // give up without doing any security critical stuff:
@@ -106,7 +151,7 @@ public final class CleanerUtil {
         // as we also catch RuntimeException below!):
         throw se;
       } catch (ReflectiveOperationException | RuntimeException e) {
-        // *** sun.misc.Cleaner unmapping (Java 8) ***
+        // *** sun.misc.Cleaner unmapping (Java 8 final fallback) ***
         final Class<?> directBufferClass =
             Class.forName("java.nio.DirectByteBuffer");
 
