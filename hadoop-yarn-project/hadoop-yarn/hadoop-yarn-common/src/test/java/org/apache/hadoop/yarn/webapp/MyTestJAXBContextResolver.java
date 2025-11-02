@@ -23,9 +23,10 @@ import java.util.HashSet;
 import java.util.Set;
 import javax.ws.rs.ext.ContextResolver;
 import javax.ws.rs.ext.Provider;
-import jakarta.xml.bind.JAXBContext;
+import javax.xml.bind.JAXBContext;
 
 import javax.inject.Singleton;
+import org.glassfish.jersey.jettison.JettisonJaxbContext;
 
 import org.apache.hadoop.yarn.webapp.MyTestWebService.MyInfo;
 
@@ -41,8 +42,9 @@ public class MyTestJAXBContextResolver implements ContextResolver<JAXBContext> {
 
   public MyTestJAXBContextResolver() throws Exception {
     this.types = new HashSet<>(Arrays.asList(cTypes));
-    // Use Jakarta XML Binding instead of JettisonJaxbContext for Java 21 compatibility
-    this.context = JAXBContext.newInstance(cTypes);
+    // Use JettisonJaxbContext for Jersey 2.46 compatibility (uses javax.xml.bind)
+    // Production code uses jakarta.xml.bind annotations which are readable by javax JAXB impl
+    this.context = new JettisonJaxbContext(cTypes);
   }
 
   @Override
