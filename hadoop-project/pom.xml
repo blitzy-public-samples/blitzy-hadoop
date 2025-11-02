@@ -2760,12 +2760,12 @@
       </dependencyManagement>
     </profile>
     <profile>
-      <id>jdk17+</id>
+      <id>jdk21+</id>
       <activation>
-        <jdk>[17,)</jdk>
+        <jdk>[21,)</jdk>
       </activation>
       <properties>
-        <javac.version>17</javac.version>
+        <javac.version>21</javac.version>
         <maven.compiler.release>${javac.version}</maven.compiler.release>
       </properties>
     </profile>

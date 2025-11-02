@@ -19,9 +19,10 @@ package org.apache.hadoop.hdfs.shortcircuit;
 
 import java.io.FileInputStream;
 import java.io.IOException;
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.BitSet;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
@@ -57,8 +58,10 @@ public class ShortCircuitShm {
   /**
    * VarHandle for atomic/volatile access to 64-bit slot control words in shared memory.
    * Replaces sun.misc.Unsafe for Java 21 compatibility.
+   * Uses ByteBuffer view for direct memory access via POSIX mmap.
    */
-  private static final VarHandle LONG_HANDLE = ValueLayout.JAVA_LONG_UNALIGNED.varHandle();
+  private static final VarHandle LONG_HANDLE = 
+      MethodHandles.byteBufferViewVarHandle(long[].class, ByteOrder.nativeOrder());
 
   /**
    * Calculate the usable size of a shared memory segment.
@@ -307,32 +310,32 @@ public class ShortCircuitShm {
      * Clear the slot.
      */
     void clear() {
-      LONG_HANDLE.setVolatile(memorySegment, this.slotAddress - baseAddress, 0L);
+      LONG_HANDLE.setVolatile(memoryBuffer, (int)(this.slotAddress - baseAddress), 0L);
     }
 
     private boolean isSet(long flag) {
-      long prev = (long) LONG_HANDLE.getVolatile(memorySegment, this.slotAddress - baseAddress);
+      long prev = (long) LONG_HANDLE.getVolatile(memoryBuffer, (int)(this.slotAddress - baseAddress));
       return (prev & flag) != 0;
     }
 
     private void setFlag(long flag) {
       long prev;
       do {
-        prev = (long) LONG_HANDLE.getVolatile(memorySegment, this.slotAddress - baseAddress);
+        prev = (long) LONG_HANDLE.getVolatile(memoryBuffer, (int)(this.slotAddress - baseAddress));
         if ((prev & flag) != 0) {
           return;
         }
-      } while (!LONG_HANDLE.compareAndSet(memorySegment, this.slotAddress - baseAddress, prev, prev | flag));
+      } while (!LONG_HANDLE.compareAndSet(memoryBuffer, (int)(this.slotAddress - baseAddress), prev, prev | flag));
     }
 
     private void clearFlag(long flag) {
       long prev;
       do {
-        prev = (long) LONG_HANDLE.getVolatile(memorySegment, this.slotAddress - baseAddress);
+        prev = (long) LONG_HANDLE.getVolatile(memoryBuffer, (int)(this.slotAddress - baseAddress));
         if ((prev & flag) == 0) {
           return;
         }
-      } while (!LONG_HANDLE.compareAndSet(memorySegment, this.slotAddress - baseAddress, prev, prev & (~flag)));
+      } while (!LONG_HANDLE.compareAndSet(memoryBuffer, (int)(this.slotAddress - baseAddress), prev, prev & (~flag)));
     }
 
     public boolean isValid() {
@@ -360,7 +363,7 @@ public class ShortCircuitShm {
     }
 
     public boolean isAnchored() {
-      long prev = (long) LONG_HANDLE.getVolatile(memorySegment, this.slotAddress - baseAddress);
+      long prev = (long) LONG_HANDLE.getVolatile(memoryBuffer, (int)(this.slotAddress - baseAddress));
       // Slot is no longer valid.
       return (prev & VALID_FLAG) != 0 && ((prev & 0x7fffffff) != 0);
     }
@@ -376,7 +379,7 @@ public class ShortCircuitShm {
     public boolean addAnchor() {
       long prev;
       do {
-        prev = (long) LONG_HANDLE.getVolatile(memorySegment, this.slotAddress - baseAddress);
+        prev = (long) LONG_HANDLE.getVolatile(memoryBuffer, (int)(this.slotAddress - baseAddress));
         if ((prev & VALID_FLAG) == 0) {
           // Slot is no longer valid.
           return false;
@@ -389,7 +392,7 @@ public class ShortCircuitShm {
           // Too many other threads have anchored the slot (2 billion?)
           return false;
         }
-      } while (!LONG_HANDLE.compareAndSet(memorySegment, this.slotAddress - baseAddress, prev, prev + 1));
+      } while (!LONG_HANDLE.compareAndSet(memoryBuffer, (int)(this.slotAddress - baseAddress), prev, prev + 1));
       return true;
     }
 
@@ -399,11 +402,11 @@ public class ShortCircuitShm {
     public void removeAnchor() {
       long prev;
       do {
-        prev = (long) LONG_HANDLE.getVolatile(memorySegment, this.slotAddress - baseAddress);
+        prev = (long) LONG_HANDLE.getVolatile(memoryBuffer, (int)(this.slotAddress - baseAddress));
         Preconditions.checkState((prev & 0x7fffffff) != 0,
             "Tried to remove anchor for slot " + slotAddress +", which was " +
             "not anchored.");
-      } while (!LONG_HANDLE.compareAndSet(memorySegment, this.slotAddress - baseAddress, prev, prev - 1));
+      } while (!LONG_HANDLE.compareAndSet(memoryBuffer, (int)(this.slotAddress - baseAddress), prev, prev - 1));
     }
 
     @Override
@@ -428,10 +431,11 @@ public class ShortCircuitShm {
   private final int mmappedLength;
 
   /**
-   * MemorySegment providing bounds-checked access to POSIX mmap'd shared memory for short-circuit read slots.
-   * Replaces absolute memory addressing with segment-relative offsets for Java 21 compatibility.
+   * ByteBuffer providing direct access to POSIX mmap'd shared memory for short-circuit read slots.
+   * Replaces sun.misc.Unsafe absolute memory addressing for Java 21 compatibility.
+   * Uses native byte order for platform compatibility.
    */
-  private final MemorySegment memorySegment;
+  private final ByteBuffer memoryBuffer;
 
   /**
    * The slots associated with this shared memory segment.
@@ -472,12 +476,47 @@ public class ShortCircuitShm {
     this.mmappedLength = getUsableLength(stream);
     this.baseAddress = POSIX.mmap(stream.getFD(),
         POSIX.MMAP_PROT_READ | POSIX.MMAP_PROT_WRITE, true, mmappedLength);
-    this.memorySegment = MemorySegment.ofAddress(baseAddress).reinterpret(mmappedLength);
+    this.memoryBuffer = createDirectBuffer(baseAddress, mmappedLength);
     this.slots = new Slot[mmappedLength / BYTES_PER_SLOT];
     this.allocatedSlots = new BitSet(slots.length);
     LOG.trace("creating {}(shmId={}, mmappedLength={}, baseAddress={}, "
         + "slots.length={})", this.getClass().getSimpleName(), shmId,
         mmappedLength, String.format("%x", baseAddress), slots.length);
+  }
+
+  /**
+   * Creates a DirectByteBuffer that wraps the native memory address from POSIX mmap.
+   * This method uses reflection to create a ByteBuffer view of externally-allocated memory,
+   * replacing the previous sun.misc.Unsafe-based approach for Java 21 compatibility.
+   * The --add-opens java.base/java.nio=ALL-UNNAMED JVM flag is required.
+   */
+  private static ByteBuffer createDirectBuffer(long address, int capacity) throws IOException {
+    try {
+      // Allocate a direct buffer of the required size
+      ByteBuffer buffer = ByteBuffer.allocateDirect(0);
+      
+      // Use reflection to access the address field and set it to our mmap'd address
+      // This is allowed with --add-opens flag and avoids using Unsafe for data operations
+      java.lang.reflect.Field addressField = java.nio.Buffer.class.getDeclaredField("address");
+      addressField.setAccessible(true);
+      addressField.setLong(buffer, address);
+      
+      // Set the capacity field
+      java.lang.reflect.Field capacityField = java.nio.Buffer.class.getDeclaredField("capacity");
+      capacityField.setAccessible(true);
+      capacityField.setInt(buffer, capacity);
+      
+      // Set the limit field
+      java.lang.reflect.Field limitField = java.nio.Buffer.class.getDeclaredField("limit");
+      limitField.setAccessible(true);
+      limitField.setInt(buffer, capacity);
+      
+      // Set native byte order for platform compatibility
+      return buffer.order(ByteOrder.nativeOrder());
+    } catch (ReflectiveOperationException e) {
+      throw new IOException("Failed to create DirectByteBuffer from mmap'd address. " +
+          "Ensure JVM is started with --add-opens java.base/java.nio=ALL-UNNAMED", e);
+    }
   }
 
   public final ShmId getShmId() {
