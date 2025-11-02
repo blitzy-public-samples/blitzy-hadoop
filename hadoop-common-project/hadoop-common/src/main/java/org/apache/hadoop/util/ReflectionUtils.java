@@ -180,7 +180,7 @@ public class ReflectionUtils {
           result = ((Constructor<T>) cached).newInstance(values);
         }
       }
-    } catch (Exception e) {
+    } catch (Throwable e) {
       throw new RuntimeException(e);
     }
     setConf(result, conf);
