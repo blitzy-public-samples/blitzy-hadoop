@@ -33,6 +33,8 @@ import static java.util.concurrent.atomic.AtomicReferenceFieldUpdater
     .newUpdater;
 
 import javax.annotation.Nullable;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.security.AccessController;
 import java.security.PrivilegedActionException;
 import java.security.PrivilegedExceptionAction;
@@ -130,8 +132,8 @@ public abstract class AbstractFuture<V> implements ListenableFuture<V> {
     AtomicHelper helper;
 
     try {
-      helper = new UnsafeAtomicHelper();
-    } catch (Throwable unsafeFailure) {
+      helper = new VarHandleAtomicHelper();
+    } catch (Throwable varHandleFailure) {
       // catch absolutely everything and fall through to our 'SafeAtomicHelper'
       // The access control checks that ARFU does means the caller class has
       // to be AbstractFuture
@@ -150,7 +152,7 @@ public abstract class AbstractFuture<V> implements ListenableFuture<V> {
         // the field is definitely there.
         // For these users fallback to a suboptimal implementation, based on
         // synchronized. This will be a definite performance hit to those users.
-        log.log(Level.SEVERE, "UnsafeAtomicHelper is broken!", unsafeFailure);
+        log.log(Level.SEVERE, "VarHandleAtomicHelper is broken!", varHandleFailure);
         log.log(
             Level.SEVERE, "SafeAtomicHelper is broken!",
             atomicReferenceFieldUpdaterFailure);
@@ -1036,111 +1038,54 @@ public abstract class AbstractFuture<V> implements ListenableFuture<V> {
   }
 
   /**
-   * {@link AtomicHelper} based on {@link sun.misc.Unsafe}.
+   * {@link AtomicHelper} based on {@link java.lang.invoke.VarHandle}.
    * <p>
    * <p>Static initialization of this class will fail if the
-   * {@link sun.misc.Unsafe} object cannot be accessed.
+   * {@link java.lang.invoke.VarHandle} operations cannot be accessed.
    */
-  private static final class UnsafeAtomicHelper extends AtomicHelper {
-    static final sun.misc.Unsafe UNSAFE;
-    static final long LISTENERS_OFFSET;
-    static final long WAITERS_OFFSET;
-    static final long VALUE_OFFSET;
-    static final long WAITER_THREAD_OFFSET;
-    static final long WAITER_NEXT_OFFSET;
+  private static final class VarHandleAtomicHelper extends AtomicHelper {
+    static final VarHandle WAITERS;
+    static final VarHandle LISTENERS;
+    static final VarHandle VALUE;
+    static final VarHandle WAITER_THREAD;
+    static final VarHandle WAITER_NEXT;
 
     static {
-      sun.misc.Unsafe unsafe = null;
       try {
-        unsafe = sun.misc.Unsafe.getUnsafe();
-      } catch (SecurityException tryReflectionInstead) {
-        try {
-          unsafe =
-              AccessController.doPrivileged(
-                  new PrivilegedExceptionAction<sun.misc.Unsafe>() {
-                    @Override
-                    public sun.misc.Unsafe run() throws Exception {
-                      Class<sun.misc.Unsafe> k = sun.misc.Unsafe.class;
-                      for (java.lang.reflect.Field f : k.getDeclaredFields()) {
-                        f.setAccessible(true);
-                        Object x = f.get(null);
-                        if (k.isInstance(x)) {
-                          return k.cast(x);
-                        }
-                      }
-                      throw new NoSuchFieldError("the Unsafe");
-                    }
-                  });
-        } catch (PrivilegedActionException e) {
-          throw new RuntimeException(
-              "Could not initialize intrinsics", e.getCause());
-        }
-      }
-      try {
-        Class<?> abstractFuture = AbstractFuture.class;
-        WAITERS_OFFSET = unsafe
-            .objectFieldOffset(abstractFuture.getDeclaredField("waiters"));
-        LISTENERS_OFFSET = unsafe
-            .objectFieldOffset(abstractFuture.getDeclaredField("listeners"));
-        VALUE_OFFSET = unsafe
-            .objectFieldOffset(abstractFuture.getDeclaredField("value"));
-        WAITER_THREAD_OFFSET = unsafe
-            .objectFieldOffset(Waiter.class.getDeclaredField("thread"));
-        WAITER_NEXT_OFFSET = unsafe
-            .objectFieldOffset(Waiter.class.getDeclaredField("next"));
-        UNSAFE = unsafe;
-      } catch (Exception e) {
-        throwIfUnchecked(e);
-        throw new RuntimeException(e);
-      }
-    }
-
-    public static void throwIfUnchecked(Throwable throwable) {
-      Preconditions.checkNotNull(throwable);
-      if (throwable instanceof RuntimeException) {
-        throw (RuntimeException) throwable;
-      }
-      if (throwable instanceof Error) {
-        throw (Error) throwable;
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        WAITERS = lookup.findVarHandle(AbstractFuture.class, "waiters", Waiter.class);
+        LISTENERS = lookup.findVarHandle(AbstractFuture.class, "listeners", Listener.class);
+        VALUE = lookup.findVarHandle(AbstractFuture.class, "value", Object.class);
+        WAITER_THREAD = lookup.findVarHandle(Waiter.class, "thread", Thread.class);
+        WAITER_NEXT = lookup.findVarHandle(Waiter.class, "next", Waiter.class);
+      } catch (ReflectiveOperationException e) {
+        throw new ExceptionInInitializerError(e);
       }
     }
 
     @Override
     void putThread(Waiter waiter, Thread newValue) {
-      UNSAFE.putObject(waiter, WAITER_THREAD_OFFSET, newValue);
+      WAITER_THREAD.set(waiter, newValue);
     }
 
     @Override
     void putNext(Waiter waiter, Waiter newValue) {
-      UNSAFE.putObject(waiter, WAITER_NEXT_OFFSET, newValue);
+      WAITER_NEXT.set(waiter, newValue);
     }
 
-    /**
-     * Performs a CAS operation on the {@link #waiters} field.
-     */
     @Override
-    boolean casWaiters(AbstractFuture<?> future, Waiter expect, Waiter
-        update) {
-      return UNSAFE
-          .compareAndSwapObject(future, WAITERS_OFFSET, expect, update);
+    boolean casWaiters(AbstractFuture<?> future, Waiter expect, Waiter update) {
+      return WAITERS.compareAndSet(future, expect, update);
     }
 
-    /**
-     * Performs a CAS operation on the {@link #listeners} field.
-     */
     @Override
-    boolean casListeners(
-        AbstractFuture<?> future, Listener expect, Listener update) {
-      return UNSAFE
-          .compareAndSwapObject(future, LISTENERS_OFFSET, expect, update);
+    boolean casListeners(AbstractFuture<?> future, Listener expect, Listener update) {
+      return LISTENERS.compareAndSet(future, expect, update);
     }
 
-    /**
-     * Performs a CAS operation on the {@link #value} field.
-     */
     @Override
     boolean casValue(AbstractFuture<?> future, Object expect, Object update) {
-      return UNSAFE.compareAndSwapObject(future, VALUE_OFFSET, expect, update);
+      return VALUE.compareAndSet(future, expect, update);
     }
   }
 
