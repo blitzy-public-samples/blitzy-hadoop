@@ -32,7 +32,7 @@ import javax.inject.Inject;
 import javax.inject.Singleton;
 import javax.ws.rs.ext.ContextResolver;
 import javax.ws.rs.ext.Provider;
-import jakarta.xml.bind.JAXBContext;
+import javax.xml.bind.JAXBContext;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
