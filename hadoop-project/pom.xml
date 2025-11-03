@@ -71,8 +71,8 @@
     <jaxb.version>4.0.3</jaxb.version>
 
     <!-- jackson versions -->
-    <jackson2.version>2.14.3</jackson2.version>
-    <jackson2.databind.version>2.14.3</jackson2.databind.version>
+    <jackson2.version>2.15.4</jackson2.version>
+    <jackson2.databind.version>2.15.4</jackson2.databind.version>
 
     <!-- httpcomponents versions -->
     <httpclient.version>4.5.13</httpclient.version>
@@ -1277,15 +1277,16 @@
         <artifactId>jackson-annotations</artifactId>
         <version>${jackson2.version}</version>
       </dependency>
-      <dependency>
-        <groupId>com.fasterxml.jackson.module</groupId>
-        <artifactId>jackson-module-jaxb-annotations</artifactId>
-        <version>${jackson2.version}</version>
-      </dependency>
       <!-- Jackson module for Jakarta XML Binding (Java 21 compatibility) -->
       <dependency>
         <groupId>com.fasterxml.jackson.module</groupId>
         <artifactId>jackson-module-jakarta-xmlbind-annotations</artifactId>
+        <version>${jackson2.version}</version>
+      </dependency>
+      <!-- Jackson JAX-RS JSON provider for Jersey 2.x (javax.ws.rs) -->
+      <dependency>
+        <groupId>com.fasterxml.jackson.jaxrs</groupId>
+        <artifactId>jackson-jaxrs-json-provider</artifactId>
         <version>${jackson2.version}</version>
       </dependency>
       <dependency>
@@ -2000,8 +2001,8 @@
           <version>${swagger-annotations-version}</version>
         </dependency>
         <dependency>
-          <groupId>com.fasterxml.jackson.jaxrs</groupId>
-          <artifactId>jackson-jaxrs-json-provider</artifactId>
+          <groupId>com.fasterxml.jackson.jakarta.rs</groupId>
+          <artifactId>jackson-jakarta-rs-json-provider</artifactId>
           <version>${jackson2.version}</version>
         </dependency>
         <dependency>

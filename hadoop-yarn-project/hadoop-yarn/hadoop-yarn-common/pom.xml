@@ -192,10 +192,18 @@
       <artifactId>jackson-databind</artifactId>
     </dependency>
     <!-- Jackson module for Jakarta XML Binding annotations (Java 21 compatibility) -->
+    <!-- Jakarta XML Bind annotations module for Jackson -->
     <dependency>
       <groupId>com.fasterxml.jackson.module</groupId>
       <artifactId>jackson-module-jakarta-xmlbind-annotations</artifactId>
     </dependency>
+    <!-- Javax JAXB annotations module (transitive from jakarta, explicit for version control) -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.module</groupId>
+      <artifactId>jackson-module-jaxb-annotations</artifactId>
+      <version>2.15.4</version>
+    </dependency>
+    <!-- Jackson JAX-RS JSON provider for Jersey 2.x (javax.ws.rs) -->
     <dependency>
       <groupId>com.fasterxml.jackson.jaxrs</groupId>
       <artifactId>jackson-jaxrs-json-provider</artifactId>
