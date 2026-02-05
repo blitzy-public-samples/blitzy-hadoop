@@ -74,7 +74,13 @@ import static org.apache.hadoop.yarn.exceptions
         .InvalidResourceRequestException.UNKNOWN_REASON_MESSAGE_TEMPLATE;
 
 /**
- * Utilities shared by schedulers. 
+ * Utilities shared by schedulers.
+ *
+ * @performance This utility class provides O(r) operations for resource validation
+ *              where r is the number of resource types (typically 2-10). All methods
+ *              are thread-safe for concurrent scheduler operations. Linear scaling
+ *              with number of resource types configured in the cluster; performance
+ *              degrades gracefully as custom resource types are added.
  */
 @Private
 @Unstable
@@ -82,18 +88,40 @@ public class SchedulerUtils {
 
   /**
    * This class contains invalid resource information along with its
-   * resource request.
+   * resource request. Used to report detailed validation failures for
+   * queue maximum resource checks.
+   *
+   * @complexity Space: O(r) where r=number of invalid resource dimensions.
+   *             Typically small (0-2 invalid resources in practice).
+   *             Source: SchedulerUtils.java:93-112
    */
   public static class MaxResourceValidationResult {
     private ResourceRequest resourceRequest;
     private List<ResourceInformation> invalidResources;
 
+    /**
+     * Constructs a validation result with the request and any invalid resources.
+     *
+     * @complexity Time: O(1) - simple assignment.
+     *             Space: O(1) - stores references, no copying.
+     *
+     * @param resourceRequest the validated request
+     * @param invalidResources list of resource dimensions that failed validation
+     */
     MaxResourceValidationResult(ResourceRequest resourceRequest,
         List<ResourceInformation> invalidResources) {
       this.resourceRequest = resourceRequest;
       this.invalidResources = invalidResources;
     }
 
+    /**
+     * Checks if the resource request passed validation.
+     *
+     * @complexity Time: O(1) - checks list emptiness.
+     *             Space: O(1) - no allocations.
+     *
+     * @return true if no invalid resources, false otherwise
+     */
     public boolean isValid() {
       return invalidResources.isEmpty();
     }
@@ -134,7 +162,11 @@ public class SchedulerUtils {
 
   /**
    * Utility to create a {@link ContainerStatus} during exceptional
-   * circumstances.
+   * circumstances with ABORTED exit status.
+   *
+   * @complexity Time: O(1) - creates single ContainerStatus via RecordFactory.
+   *             Space: O(1) - single ContainerStatus allocation (~100 bytes).
+   *             Source: SchedulerUtils.java:172-176
    *
    * @param containerId {@link ContainerId} of returned/released/lost container.
    * @param diagnostics diagnostic message
@@ -150,6 +182,11 @@ public class SchedulerUtils {
 
   /**
    * Utility to create a {@link ContainerStatus} for killed containers.
+   *
+   * @complexity Time: O(1) - creates single ContainerStatus via RecordFactory.
+   *             Space: O(1) - single ContainerStatus allocation (~100 bytes).
+   *             Source: SchedulerUtils.java:185-189
+   *
    * @param containerId {@link ContainerId} of the killed container.
    * @param diagnostics diagnostic message
    * @return <code>ContainerStatus</code> for a killed container
@@ -162,7 +199,11 @@ public class SchedulerUtils {
 
   /**
    * Utility to create a {@link ContainerStatus} during exceptional
-   * circumstances.
+   * circumstances with PREEMPTED exit status.
+   *
+   * @complexity Time: O(1) - creates single ContainerStatus via RecordFactory.
+   *             Space: O(1) - single ContainerStatus allocation (~100 bytes).
+   *             Source: SchedulerUtils.java:200-204
    *
    * @param containerId {@link ContainerId} of returned/released/lost container.
    * @param diagnostics diagnostic message
@@ -179,7 +220,15 @@ public class SchedulerUtils {
    * Utility to create a {@link ContainerStatus} during exceptional
    * circumstances.
    *
+   * @complexity Time: O(1) - creates single ContainerStatus via RecordFactory.
+   *             Space: O(1) - single ContainerStatus allocation (~100 bytes).
+   *             Source: SchedulerUtils.java:215-224
+   * @implNote Uses RecordFactory for consistent object creation across
+   *           serialization frameworks. ContainerStatus is marked COMPLETE
+   *           regardless of specific exit status to indicate termination.
+   *
    * @param containerId {@link ContainerId} of returned/released/lost container.
+   * @param exitStatus the exit status code
    * @param diagnostics diagnostic message
    * @return <code>ContainerStatus</code> for an returned/released/lost 
    *         container
@@ -198,6 +247,14 @@ public class SchedulerUtils {
   /**
    * Utility method to normalize a resource request, by ensuring that the
    * requested memory is a multiple of minMemory and is not zero.
+   *
+   * @complexity Time: O(r) where r=number of resource types (typically 2-10);
+   *             iterates through each resource dimension for normalization.
+   *             Space: O(1) - modifies request in place, no auxiliary allocations.
+   *             Source: SchedulerUtils.java:209-217
+   * @implNote Uses integer ceiling for proper resource alignment to increment
+   *           boundaries. Minimum resource is used as the increment value for
+   *           normalization, ensuring allocations align to cluster granularity.
    *
    * @param ask resource request.
    * @param resourceCalculator {@link ResourceCalculator} the resource
@@ -220,6 +277,15 @@ public class SchedulerUtils {
    * Utility method to normalize a resource request, by ensuring that the
    * requested memory is a multiple of increment resource and is not zero.
    *
+   * @complexity Time: O(r) where r=number of resource types; performs ceiling
+   *             division and clamping for each resource dimension.
+   *             Space: O(r) for creating normalized Resource copy.
+   *             Source: SchedulerUtils.java:241-251
+   * @implNote Resource normalization uses integer ceiling to round up to
+   *           the nearest increment boundary, ensuring fair allocation
+   *           granularity. Values are clamped between minimum and maximum
+   *           after normalization to prevent invalid allocations.
+   *
    * @param ask resource request.
    * @param resourceCalculator {@link ResourceCalculator} the resource
    * calculator to use.
@@ -240,6 +306,20 @@ public class SchedulerUtils {
     return normalized;
   }
 
+  /**
+   * Normalizes node label expression in a resource request using queue defaults.
+   *
+   * @complexity Time: O(1) - simple conditional assignments and string comparisons.
+   *             Space: O(1) - no allocations, modifies request in place.
+   *             Source: SchedulerUtils.java:259-288
+   * @implNote Label normalization follows precedence: (1) explicit request label,
+   *           (2) queue's default label for ANY requests, (3) NO_LABEL for
+   *           pre-configured queues without label. Dynamic queues handle labels
+   *           separately in RMAppAttemptImpl.ScheduledTransition.
+   *
+   * @param resReq resource request to normalize
+   * @param queueInfo queue information containing default label expression
+   */
   private static void normalizeNodeLabelExpressionInRequest(
       ResourceRequest resReq, QueueInfo queueInfo) {
 
@@ -271,6 +351,29 @@ public class SchedulerUtils {
     }
   }
 
+  /**
+   * Normalizes and validates a resource request against cluster constraints.
+   *
+   * @complexity Time: O(r) where r=number of resource types for validation;
+   *             performs label validation O(1) and resource bounds checking O(r).
+   *             Space: O(1) - no auxiliary data structures allocated.
+   *             Source: SchedulerUtils.java:290-324
+   * @implNote Validation order is critical: (1) node label enablement check,
+   *           (2) queue info resolution for dynamic queues, (3) label
+   *           expression normalization, (4) resource bounds validation.
+   *           This ordering ensures early failure for invalid labels before
+   *           expensive resource validation. Recovery mode skips validation
+   *           to allow container recovery from AM failures.
+   *
+   * @param resReq resource request to normalize and validate
+   * @param maximumAllocation maximum allowed allocation
+   * @param queueName target queue name
+   * @param isRecovery whether this is a recovery operation (skips validation)
+   * @param rmContext RM context for accessing scheduler and configuration
+   * @param queueInfo queue information (may be null for auto-created queues)
+   * @param nodeLabelsEnabled whether node labels feature is enabled
+   * @throws InvalidResourceRequestException if request violates constraints
+   */
   public static void normalizeAndValidateRequest(ResourceRequest resReq,
       Resource maximumAllocation, String queueName, boolean isRecovery,
       RMContext rmContext, QueueInfo queueInfo, boolean nodeLabelsEnabled)
@@ -307,6 +410,25 @@ public class SchedulerUtils {
     }
   }
 
+  /**
+   * Normalizes and validates a resource request (non-recovery mode).
+   *
+   * @complexity Time: O(r) where r=number of resource types; delegates to
+   *             full validation method with isRecovery=false.
+   *             Space: O(1) - passthrough method with no allocations.
+   *             Source: SchedulerUtils.java:326-332
+   * @implNote Convenience overload that always performs full validation.
+   *           Use the overload with isRecovery parameter for AM recovery
+   *           scenarios where validation should be skipped.
+   *
+   * @param resReq resource request to normalize and validate
+   * @param maximumAllocation maximum allowed allocation
+   * @param queueName target queue name
+   * @param rmContext RM context for accessing scheduler and configuration
+   * @param queueInfo queue information (may be null for auto-created queues)
+   * @param nodeLabelsEnabled whether node labels feature is enabled
+   * @throws InvalidResourceRequestException if request violates constraints
+   */
   public static void normalizeAndValidateRequest(ResourceRequest resReq,
       Resource maximumAllocation, String queueName, RMContext rmContext,
       QueueInfo queueInfo, boolean nodeLabelsEnabled)
@@ -320,6 +442,16 @@ public class SchedulerUtils {
    * 1) If request is "x" and app label is not "x",
    *    override request to app's label.
    * 2) If app label is "x", ensure request is "x".
+   *
+   * @complexity Time: O(p) where p=number of enforced partitions; uses
+   *             HashSet.contains() which is O(1) amortized per lookup.
+   *             Space: O(1) - modifies request in place, no allocations.
+   *             Source: SchedulerUtils.java:343-355
+   * @implNote Uses HashSet for enforcedPartitions to achieve O(1) amortized
+   *           lookup time vs O(p) linear scan with List. This is critical
+   *           for clusters with many partition constraints where this method
+   *           is called for every resource request.
+   *
    * @param resReq resource request
    * @param enforcedPartitions list of exclusive enforced partitions
    * @param appLabel app's node label expression
@@ -340,7 +472,19 @@ public class SchedulerUtils {
 
   /**
    * Utility method to validate a resource request, by ensuring that the
-   * requested memory/vcore is non-negative and not greater than max
+   * requested memory/vcore is non-negative and not greater than max.
+   *
+   * @complexity Time: O(r + L) where r=number of resource types and L=label
+   *             expression length. Resource validation iterates all types O(r),
+   *             label parsing splits on "&&" and checks queue access O(L).
+   *             Space: O(1) - no auxiliary data structures created.
+   *             Source: SchedulerUtils.java:363-405
+   * @implNote Validation order: (1) resource bounds check via
+   *           checkResourceRequestAgainstAvailableResource O(r), (2) label
+   *           expression location validation (must be ANY for specific nodes),
+   *           (3) single label enforcement (no && allowed), (4) queue label
+   *           accessibility check. Early termination on first validation
+   *           failure for efficiency.
    *
    * @throws InvalidResourceRequestException when there is invalid request
    */
@@ -388,6 +532,19 @@ public class SchedulerUtils {
     }
   }
 
+  /**
+   * Extracts resource dimensions that have zero allocation from a Resource.
+   *
+   * @complexity Time: O(r) where r=number of resource types; iterates all dimensions.
+   *             Space: O(r) worst-case for result map when all resources are zero.
+   *             Source: SchedulerUtils.java:407-421
+   * @implNote Used to identify resource types that are effectively disabled
+   *           in a queue's maximum allocation. Requesting non-zero values for
+   *           these types should be flagged as invalid.
+   *
+   * @param resource the resource to analyze
+   * @return map of resource names to ResourceInformation for zero-valued dimensions
+   */
   private static Map<String, ResourceInformation> getZeroResources(
       Resource resource) {
     Map<String, ResourceInformation> resourceInformations = Maps.newHashMap();
@@ -404,10 +561,28 @@ public class SchedulerUtils {
     return resourceInformations;
   }
 
+  /**
+   * Validates that a requested resource does not exceed available resource
+   * and is non-negative for all resource dimensions.
+   *
+   * @complexity Time: O(r) where r=number of resource types (typically 2-10);
+   *             iterates through each resource dimension for comparison.
+   *             Space: O(1) - performs in-place validation with no allocations.
+   *             Source: SchedulerUtils.java:425-443
+   * @implNote Validation checks both negative values (invalid) and values
+   *           exceeding maximum allocation. Unit conversion is handled
+   *           internally via checkResource() when comparing resources with
+   *           different units (e.g., MB vs GB).
+   *
+   * @param reqResource the requested resource to validate
+   * @param availableResource the maximum available resource
+   * @throws InvalidResourceRequestException if request is invalid
+   */
   @Private
   @VisibleForTesting
   static void checkResourceRequestAgainstAvailableResource(Resource reqResource,
       Resource availableResource) throws InvalidResourceRequestException {
+    // @PerformanceCritical: Resource validation loop executed for every container request
     for (int i = 0; i < ResourceUtils.getNumberOfCountableResourceTypes(); i++) {
       final ResourceInformation requestedRI =
           reqResource.getResourceInformation(i);
@@ -426,6 +601,24 @@ public class SchedulerUtils {
     }
   }
 
+  /**
+   * Validates a resource request against queue's maximum resource allocation,
+   * identifying any resource dimensions that exceed allowed limits.
+   *
+   * @complexity Time: O(r) where r=number of resource types; iterates twice:
+   *             once to build zero-resource map O(r), once to validate O(r).
+   *             Space: O(r) for zero-resources map and invalid resources list.
+   *             Source: SchedulerUtils.java:447-470
+   * @implNote This validation is separate from global max allocation check.
+   *           Queue-specific limits may be more restrictive. Returns detailed
+   *           validation result rather than throwing exception to allow
+   *           caller to handle partial failures gracefully.
+   *
+   * @param resReq resource request to validate
+   * @param availableResource queue's maximum available resource
+   * @return validation result containing any invalid resource dimensions
+   * @throws SchedulerInvalidResourceRequestException for fatal validation errors
+   */
   public static MaxResourceValidationResult
       validateResourceRequestsAgainstQueueMaxResource(
       ResourceRequest resReq, Resource availableResource)
@@ -454,10 +647,20 @@ public class SchedulerUtils {
   }
 
   /**
-   * Checks requested ResouceInformation against available Resource.
-   * @param requestedRI
-   * @param availableResource
-   * @return true if request is valid, false otherwise.
+   * Checks requested ResourceInformation against available Resource.
+   *
+   * @complexity Time: O(1) for single resource dimension comparison;
+   *             unit conversion via UnitsConversionUtil.convert() is O(1).
+   *             Space: O(1) - uses only primitive local variables.
+   *             Source: SchedulerUtils.java:478-517
+   * @implNote Handles unit conversion transparently when comparing resources
+   *           with different units (e.g., "m" vs "K" for memory, "Mi" vs "Gi"
+   *           for storage). Converts the smaller unit to larger for comparison
+   *           to avoid overflow issues with large values.
+   *
+   * @param requestedRI the requested resource information
+   * @param availableResource the available resource to compare against
+   * @return true if request is valid (within limits), false otherwise
    */
   private static boolean checkResource(
       ResourceInformation requestedRI, Resource availableResource) {
@@ -500,6 +703,22 @@ public class SchedulerUtils {
     return requestedResourceValue <= availableResourceValue;
   }
 
+  /**
+   * Throws an InvalidResourceRequestException with appropriate error message.
+   *
+   * @complexity Time: O(1) - string formatting and exception creation.
+   *             Space: O(1) - creates single exception object with message string.
+   *             Source: SchedulerUtils.java:519-544
+   * @implNote Centralizes error message formatting for consistent exception
+   *           handling. Message templates are shared static constants for
+   *           memory efficiency and localization potential.
+   *
+   * @param reqResource the invalid requested resource
+   * @param maxAllowedAllocation maximum allowed allocation for context
+   * @param reqResourceName name of the specific invalid resource dimension
+   * @param invalidResourceType the type of validation failure
+   * @throws InvalidResourceRequestException always thrown with formatted message
+   */
   private static void throwInvalidResourceException(Resource reqResource,
           Resource maxAllowedAllocation, String reqResourceName,
           InvalidResourceType invalidResourceType)
@@ -527,6 +746,21 @@ public class SchedulerUtils {
     throw new InvalidResourceRequestException(message, invalidResourceType);
   }
 
+  /**
+   * Validates that a label expression exists in the cluster's label manager.
+   *
+   * @complexity Time: O(1) amortized; RMNodeLabelsManager.containsNodeLabel()
+   *             uses HashSet lookup internally.
+   *             Space: O(1) - no allocations.
+   *             Source: SchedulerUtils.java:546-557
+   * @implNote This check ensures labels used in requests actually exist in the
+   *           cluster configuration. Missing labels indicate configuration errors
+   *           that should be flagged early rather than causing scheduling failures.
+   *
+   * @param labelExpression the label to validate
+   * @param rmContext RM context for accessing node label manager
+   * @throws InvalidLabelResourceRequestException if label doesn't exist
+   */
   private static void checkQueueLabelInLabelManager(String labelExpression,
       RMContext rmContext) throws InvalidLabelResourceRequestException {
     // check node label manager contains this label
@@ -543,6 +777,16 @@ public class SchedulerUtils {
   /**
    * Check queue label expression, check if node label in queue's
    * node-label-expression existed in clusterNodeLabels if rmContext != null.
+   *
+   * @complexity Time: O(L * q) where L=number of labels in expression (split on &&)
+   *             and q=queue labels set size. For each label token, performs
+   *             HashSet.contains() which is O(1) amortized, so effective O(L).
+   *             Space: O(L) for split string array allocation.
+   *             Source: SchedulerUtils.java:570-591
+   * @implNote Uses HashSet for queueLabels to achieve O(1) amortized lookup
+   *           per label check. The ANY label (*) acts as wildcard allowing
+   *           any label expression. Label expressions with && are split and
+   *           each component validated independently.
    *
    * @param queueLabels queue Labels.
    * @param labelExpression label expression.
@@ -575,6 +819,16 @@ public class SchedulerUtils {
   }
 
 
+  /**
+   * Converts QueueACL enum to AccessType enum for authorization checks.
+   *
+   * @complexity Time: O(1) - simple switch statement with constant branches.
+   *             Space: O(1) - no allocations, returns existing enum constant.
+   *             Source: SchedulerUtils.java:594-602
+   *
+   * @param acl the queue ACL to convert
+   * @return corresponding AccessType or null if no mapping exists
+   */
   public static AccessType toAccessType(QueueACL acl) {
     switch (acl) {
     case ADMINISTER_QUEUE:
@@ -585,6 +839,20 @@ public class SchedulerUtils {
     return null;
   }
 
+  /**
+   * Checks if there are pending resource requests for a given partition.
+   *
+   * @complexity Time: O(r) where r=number of resource types; comparison
+   *             iterates through all resource dimensions.
+   *             Space: O(1) - no allocations, uses existing Resource objects.
+   *             Source: SchedulerUtils.java:604-611
+   *
+   * @param rc resource calculator for comparison
+   * @param usage resource usage tracking object
+   * @param partitionToLookAt partition to check for pending resources
+   * @param cluster total cluster resource for normalization
+   * @return true if pending resources exist, false otherwise
+   */
   private static boolean hasPendingResourceRequest(ResourceCalculator rc,
       ResourceUsage usage, String partitionToLookAt, Resource cluster) {
     if (Resources.greaterThan(rc, cluster,
@@ -594,6 +862,24 @@ public class SchedulerUtils {
     return false;
   }
 
+  /**
+   * Checks if there are pending resource requests considering scheduling mode.
+   *
+   * @complexity Time: O(r) where r=number of resource types; delegates to
+   *             private hasPendingResourceRequest with partition adjustment.
+   *             Space: O(1) - no allocations, simple delegation.
+   *             Source: SchedulerUtils.java:628-639
+   * @implNote When schedulingMode is IGNORE_PARTITION_EXCLUSIVITY, checks
+   *           pending for NO_LABEL partition instead of specified partition.
+   *           This allows opportunistic scheduling across partitions.
+   *
+   * @param rc resource calculator for comparison
+   * @param usage resource usage tracking object
+   * @param nodePartition partition of the node being considered
+   * @param cluster total cluster resource for normalization
+   * @param schedulingMode scheduling mode affecting partition lookup
+   * @return true if pending resources exist, false otherwise
+   */
   @Private
   public static boolean hasPendingResourceRequest(ResourceCalculator rc,
       ResourceUsage usage, String nodePartition, Resource cluster,
@@ -605,6 +891,24 @@ public class SchedulerUtils {
     return hasPendingResourceRequest(rc, usage, partitionToLookAt, cluster);
   }
 
+  /**
+   * Creates an RMContainer for opportunistic container allocation.
+   *
+   * @complexity Time: O(1) for container creation and node/attempt lookups
+   *             (HashMap-based). addRMContainer and allocateContainer are O(1)
+   *             for internal map operations.
+   *             Space: O(1) for single RMContainerImpl allocation (~500 bytes).
+   *             Source: SchedulerUtils.java:641-658
+   * @implNote Opportunistic containers bypass capacity scheduling and are
+   *           allocated directly to nodes with available resources. The
+   *           isRemotelyAllocated flag indicates distributed scheduling.
+   *           Returns null if node lookup fails (node may have been removed).
+   *
+   * @param rmContext RM context for scheduler access
+   * @param container the container to wrap
+   * @param isRemotelyAllocated whether container was allocated by distributed scheduler
+   * @return RMContainer wrapper or null if node not found
+   */
   public static RMContainer createOpportunisticRmContainer(RMContext rmContext,
       Container container, boolean isRemotelyAllocated) {
     SchedulerNode node = ((AbstractYarnScheduler) rmContext.getScheduler())
@@ -624,6 +928,21 @@ public class SchedulerUtils {
     return rmContainer;
   }
 
+  /**
+   * Checks if a node has heartbeated within the specified interval.
+   *
+   * @complexity Time: O(1) - simple arithmetic comparison with monotonic time.
+   *             Space: O(1) - uses only primitive local variable.
+   *             Source: SchedulerUtils.java:660-665
+   * @implNote Uses monotonic time to avoid issues with system clock adjustments.
+   *           Nodes that haven't heartbeated within skipNodeInterval are
+   *           considered stale and may be skipped during scheduling to avoid
+   *           allocating to potentially dead nodes.
+   *
+   * @param node the scheduler node to check
+   * @param skipNodeInterval maximum allowed time since last heartbeat (ms)
+   * @return true if node heartbeated within interval, false if stale
+   */
   public static boolean isNodeHeartbeated(SchedulerNode node,
       long skipNodeInterval) {
     long timeElapsedFromLastHeartbeat =
