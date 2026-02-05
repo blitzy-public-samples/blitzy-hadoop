@@ -65,6 +65,32 @@ import org.apache.hadoop.yarn.util.resource.Resources;
 /**
  * This class keeps track of all the consumption of an application. This also
  * keeps track of current running/completed containers for the application.
+ *
+ * <p>This class manages resource requests, scheduling keys, and blacklist
+ * information for an application attempt during scheduling.</p>
+ *
+ * @performance Memory footprint: O(p + b) where p=pending requests count and b=blacklist size.
+ *              Operations scale linearly with pending request count. Concurrent read access
+ *              is optimized via ReentrantReadWriteLock allowing multiple readers during
+ *              scheduling decisions while serializing write operations for request updates.
+ *
+ * @implNote Data structure selection rationale:
+ *           <ul>
+ *           <li>{@code ConcurrentSkipListSet} for schedulerKeys provides O(log p) ordered
+ *               access for priority-based scheduling vs O(p) unsorted iteration with HashSet;
+ *               enables efficient first()/last() operations for priority queue semantics.</li>
+ *           <li>{@code ConcurrentHashMap} for schedulerKeyToAppPlacementAllocator provides
+ *               O(1) average lookup with thread safety for concurrent scheduler access;
+ *               chosen over synchronized HashMap for better concurrent read throughput.</li>
+ *           <li>{@code HashSet} for placesBlacklistedByApp and placesBlacklistedBySystem
+ *               enables O(1) membership checks vs O(n) list iteration; blacklist operations
+ *               are synchronized for thread safety during updates.</li>
+ *           <li>{@code ReentrantReadWriteLock} separates read and write access patterns;
+ *               scheduling decisions (reads) can proceed concurrently while request updates
+ *               (writes) are serialized, optimizing for read-heavy scheduling workloads.</li>
+ *           </ul>
+ *
+ * Source: AppSchedulingInfo.java:90-101
  */
 @Private
 @Unstable
@@ -202,6 +228,13 @@ public class AppSchedulingInfo {
 
   /**
    * Clear any pending requests from this application.
+   *
+   * @complexity Time: O(p) where p=number of pending requests (scheduler keys);
+   *             both ConcurrentSkipListSet.clear() and ConcurrentHashMap.clear()
+   *             iterate through all entries.
+   *             Space: O(p) memory freed from cleared data structures.
+   *
+   * Source: AppSchedulingInfo.java:206-210
    */
   private void clearRequests() {
     schedulerKeys.clear();
@@ -218,10 +251,18 @@ public class AppSchedulingInfo {
    * application, by asking for more resources and releasing resources acquired
    * by the application.
    *
+   * @complexity Time: O(r) where r=number of resource requests being updated;
+   *             each request requires HashMap grouping O(1) amortized, then
+   *             O(1) AppPlacementAllocator lookup/creation and update.
+   *             Space: O(r) for temporary dedup HashMap during request grouping,
+   *             plus O(r) for storing new pending requests in AppPlacementAllocator.
+   *
    * @param resourceRequests resource requests to be allocated
    * @param recoverPreemptedRequestForAContainer
    *          recover ResourceRequest/SchedulingRequest on preemption
    * @return true if any resource was updated, false otherwise
+   *
+   * Source: AppSchedulingInfo.java:226-241
    */
   public boolean updateResourceRequests(List<ResourceRequest> resourceRequests,
       boolean recoverPreemptedRequestForAContainer) {
@@ -245,10 +286,17 @@ public class AppSchedulingInfo {
    * application, by asking for more resources and releasing resources acquired
    * by the application.
    *
+   * @complexity Time: O(k * a) where k=number of scheduler keys in dedupRequests,
+   *             a=average asks per key; each key requires O(1) AppPlacementAllocator
+   *             lookup via ConcurrentHashMap and O(a) pending ask updates.
+   *             Space: O(k * a) for storing pending requests in AppPlacementAllocator.
+   *
    * @param dedupRequests (dedup) resource requests to be allocated
    * @param recoverPreemptedRequestForAContainer
    *          recover ResourceRequest/SchedulingRequest on preemption
    * @return true if any resource was updated, false otherwise
+   *
+   * Source: AppSchedulingInfo.java:253-269
    */
   public boolean updateResourceRequests(
       Map<SchedulerRequestKey, Map<String, ResourceRequest>> dedupRequests,
@@ -273,10 +321,17 @@ public class AppSchedulingInfo {
    * application, by asking for more resources and releasing resources acquired
    * by the application.
    *
+   * @complexity Time: O(s) where s=number of scheduling requests; each request
+   *             requires O(1) ConcurrentHashMap lookup for AppPlacementAllocator
+   *             and O(1) pending ask update.
+   *             Space: O(s) for storing new pending requests in AppPlacementAllocators.
+   *
    * @param schedulingRequests resource requests to be allocated
    * @param recoverPreemptedRequestForAContainer
    *          recover ResourceRequest/SchedulingRequest on preemption
    * @return true if any resource was updated, false otherwise
+   *
+   * Source: AppSchedulingInfo.java:281-297
    */
   public boolean updateSchedulingRequests(
       List<SchedulingRequest> schedulingRequests,
@@ -456,10 +511,21 @@ public class AppSchedulingInfo {
    * The ApplicationMaster is updating the placesBlacklistedByApp used for
    * containers other than AMs.
    *
+   * @complexity Time: O(a + r) where a=blacklist additions count, r=removals count;
+   *             HashSet.addAll() is O(a) and HashSet.removeAll() is O(r) for
+   *             membership checks and modifications.
+   *             Space: O(a) for storing new blacklist entries in HashSet.
+   *
+   * @implNote Uses HashSet for blacklist storage enabling O(1) membership checks
+   *           during scheduling vs O(n) with list-based storage; synchronized
+   *           block ensures thread-safe updates during concurrent scheduling.
+   *
    * @param blacklistAdditions
    *          resources to be added to the userBlacklist
    * @param blacklistRemovals
    *          resources to be removed from the userBlacklist
+   *
+   * Source: AppSchedulingInfo.java:455-470
    */
   public void updatePlacesBlacklistedByApp(
       List<String> blacklistAdditions, List<String> blacklistRemovals) {
@@ -473,10 +539,16 @@ public class AppSchedulingInfo {
    * Update the list of places that are blacklisted by the system. Today the
    * system only blacklists places when it sees that AMs failed there
    *
+   * @complexity Time: O(a + r) where a=blacklist additions count, r=removals count;
+   *             HashSet.addAll() is O(a) and HashSet.removeAll() is O(r).
+   *             Space: O(a) for storing new blacklist entries in HashSet.
+   *
    * @param blacklistAdditions
    *          resources to be added to placesBlacklistedBySystem
    * @param blacklistRemovals
    *          resources to be removed from placesBlacklistedBySystem
+   *
+   * Source: AppSchedulingInfo.java:481-485
    */
   public void updatePlacesBlacklistedBySystem(
       List<String> blacklistAdditions, List<String> blacklistRemovals) {
@@ -503,13 +575,36 @@ public class AppSchedulingInfo {
     return userBlacklistChanged.getAndSet(false);
   }
 
+  /**
+   * Returns the collection of scheduler keys for pending requests.
+   *
+   * @complexity Time: O(1) for returning reference to internal ConcurrentSkipListSet.
+   *             Space: O(1) - no additional allocation, returns view of existing data.
+   *
+   * @implNote Returns the underlying ConcurrentSkipListSet directly providing
+   *           O(log p) ordered access for priority-based scheduling. Iteration
+   *           over returned collection is O(p) where p=pending requests.
+   *
+   * @return collection of scheduler request keys
+   *
+   * Source: AppSchedulingInfo.java:506-508
+   */
   public Collection<SchedulerRequestKey> getSchedulerKeys() {
     return schedulerKeys;
   }
 
   /**
    * Used by REST API to fetch ResourceRequest
+   *
+   * @complexity Time: O(k * a) where k=number of scheduler keys (AppPlacementAllocators),
+   *             a=average resource requests per allocator; iterates all allocators and
+   *             collects their resource requests.
+   *             Space: O(p) where p=total pending requests for ArrayList allocation
+   *             to hold all ResourceRequest objects.
+   *
    * @return All pending ResourceRequests.
+   *
+   * Source: AppSchedulingInfo.java:514-526
    */
   public List<ResourceRequest> getAllResourceRequests() {
     List<ResourceRequest> ret = new ArrayList<>();
@@ -527,7 +622,15 @@ public class AppSchedulingInfo {
 
   /**
    * Fetch SchedulingRequests.
+   *
+   * @complexity Time: O(k) where k=number of scheduler keys (AppPlacementAllocators);
+   *             iterates all allocators and filters for non-null scheduling requests.
+   *             Space: O(s) where s=scheduling requests with non-null values for
+   *             ArrayList allocation.
+   *
    * @return All pending SchedulingRequests.
+   *
+   * Source: AppSchedulingInfo.java:532-543
    */
   public List<SchedulingRequest> getAllSchedulingRequests() {
     List<SchedulingRequest> ret = new ArrayList<>();
@@ -556,6 +659,21 @@ public class AppSchedulingInfo {
     }
   }
 
+  /**
+   * Returns the next pending ask based on priority ordering.
+   *
+   * @complexity Time: O(log p) for ConcurrentSkipListSet.first() to get highest
+   *             priority key, plus O(1) for ConcurrentHashMap lookup.
+   *             Space: O(1) - no additional allocation.
+   *
+   * @implNote Uses ConcurrentSkipListSet.first() which provides O(log p) access
+   *           to the minimum (highest priority) scheduler key, enabling efficient
+   *           priority-based scheduling without full iteration.
+   *
+   * @return the pending ask for the highest priority request, or null if none
+   *
+   * Source: AppSchedulingInfo.java:559-571
+   */
   public PendingAsk getNextPendingAsk() {
     readLock.lock();
     try {
@@ -570,10 +688,37 @@ public class AppSchedulingInfo {
     }
   }
 
+  /**
+   * Returns the pending ask for a scheduler key with ANY resource name.
+   *
+   * @complexity Time: O(1) for ConcurrentHashMap lookup of AppPlacementAllocator.
+   *             Space: O(1) - no additional allocation.
+   *
+   * @param schedulerKey the scheduler request key
+   * @return the pending ask for ANY resource, or ZERO if not found
+   *
+   * Source: AppSchedulingInfo.java:573-575
+   */
   public PendingAsk getPendingAsk(SchedulerRequestKey schedulerKey) {
     return getPendingAsk(schedulerKey, ResourceRequest.ANY);
   }
 
+  /**
+   * Returns the pending ask for a scheduler key and specific resource name.
+   *
+   * @complexity Time: O(1) for ConcurrentHashMap lookup of AppPlacementAllocator,
+   *             plus O(1) for internal pending ask retrieval.
+   *             Space: O(1) - no additional allocation.
+   *
+   * @implNote Uses ConcurrentHashMap for O(1) average-case lookup with thread safety,
+   *           avoiding synchronization overhead during read-heavy scheduling operations.
+   *
+   * @param schedulerKey the scheduler request key
+   * @param resourceName the resource name (node, rack, or ANY)
+   * @return the pending ask, or ZERO if not found
+   *
+   * Source: AppSchedulingInfo.java:577-587
+   */
   public PendingAsk getPendingAsk(SchedulerRequestKey schedulerKey,
       String resourceName) {
     this.readLock.lock();
@@ -590,11 +735,21 @@ public class AppSchedulingInfo {
    * Returns if the place (node/rack today) is either blacklisted by the
    * application (user) or the system.
    *
+   * @complexity Time: O(1) for HashSet.contains() lookup in either blacklist.
+   *             Space: O(1) - no additional allocation.
+   *
+   * @implNote Uses HashSet for blacklist storage enabling O(1) membership checks
+   *           during scheduling decisions. Synchronized access ensures consistent
+   *           reads while blacklist may be concurrently updated. This is called
+   *           frequently during node selection, so O(1) lookup is critical.
+   *
    * @param resourceName
    *          the resourcename
    * @param blacklistedBySystem
    *          true if it should check amBlacklist
    * @return true if its blacklisted
+   *
+   * Source: AppSchedulingInfo.java:599-610
    */
   public boolean isPlaceBlacklisted(String resourceName,
       boolean blacklistedBySystem) {
@@ -609,6 +764,27 @@ public class AppSchedulingInfo {
     }
   }
 
+  /**
+   * Allocates a container for the specified scheduler key and node.
+   *
+   * @complexity Time: O(1) amortized for ConcurrentHashMap lookup and
+   *             AppPlacementAllocator.allocate() which decrements pending count.
+   *             Metrics update is O(1) for counter increments.
+   *             Space: O(1) - ContainerRequest returned is existing object reference.
+   *
+   * @implNote ConcurrentHashMap.get() provides O(1) average lookup. The allocate
+   *           operation on AppPlacementAllocator decrements the pending ask count
+   *           which is an O(1) operation. Write lock ensures atomic allocation
+   *           preventing double-allocation of same request.
+   *
+   * @param type the node type (NODE_LOCAL, RACK_LOCAL, OFF_SWITCH)
+   * @param node the scheduler node for allocation
+   * @param schedulerKey the scheduler request key
+   * @param containerAllocated the allocated container (may be null)
+   * @return the container request that was satisfied
+   *
+   * Source: AppSchedulingInfo.java:612-626
+   */
   public ContainerRequest allocate(NodeType type,
       SchedulerNode node, SchedulerRequestKey schedulerKey,
       RMContainer containerAllocated) {
@@ -625,12 +801,31 @@ public class AppSchedulingInfo {
     }
   }
 
+  /**
+   * Checks if the application should be deactivated (no pending requests).
+   *
+   * @complexity Time: O(1) for ConcurrentSkipListSet.isEmpty() check.
+   *             Space: O(1) - no additional allocation.
+   *
+   * Source: AppSchedulingInfo.java:628-632
+   */
   public void checkForDeactivation() {
     if (schedulerKeys.isEmpty()) {
       abstractUsersManager.deactivateApplication(user, applicationId);
     }
   }
   
+  /**
+   * Moves application's pending resources from old queue to new queue.
+   *
+   * @complexity Time: O(p) where p=number of pending requests (AppPlacementAllocators);
+   *             iterates all allocators to transfer pending resource metrics.
+   *             Space: O(1) - no additional allocation beyond temporary Resource objects.
+   *
+   * @param newQueue the queue to move the application to
+   *
+   * Source: AppSchedulingInfo.java:634-672
+   */
   public void move(Queue newQueue) {
     this.writeLock.lock();
     try {
@@ -671,6 +866,16 @@ public class AppSchedulingInfo {
     }
   }
 
+  /**
+   * Stops the application and clears all pending resource metrics.
+   *
+   * @complexity Time: O(p) where p=number of pending requests (AppPlacementAllocators);
+   *             iterates all allocators to clear metrics, then calls clearRequests()
+   *             which is also O(p).
+   *             Space: O(p) memory freed from cleared data structures.
+   *
+   * Source: AppSchedulingInfo.java:674-700
+   */
   public void stop() {
     // clear pending resources metrics for the application
     this.writeLock.lock();
@@ -713,6 +918,17 @@ public class AppSchedulingInfo {
     return this.placesBlacklistedByApp;
   }
 
+  /**
+   * Returns a copy of the application blacklist.
+   *
+   * @complexity Time: O(b) where b=blacklist size; HashSet copy constructor
+   *             iterates all elements.
+   *             Space: O(b) for the new HashSet allocation.
+   *
+   * @return copy of the application blacklist set
+   *
+   * Source: AppSchedulingInfo.java:716-720
+   */
   public Set<String> getBlackListCopy() {
     synchronized (placesBlacklistedByApp) {
       return new HashSet<>(this.placesBlacklistedByApp);
@@ -752,9 +968,20 @@ public class AppSchedulingInfo {
     }
   }
 
-  /*
+  /**
    * In async environment, pending resource request could be updated during
-   * scheduling, this method checks pending request before allocating
+   * scheduling, this method checks pending request before allocating.
+   *
+   * @complexity Time: O(1) for ConcurrentHashMap.get() lookup and
+   *             canAllocate() check on AppPlacementAllocator.
+   *             Space: O(1) - no additional allocation.
+   *
+   * @param type the node type (NODE_LOCAL, RACK_LOCAL, OFF_SWITCH)
+   * @param node the scheduler node to check
+   * @param schedulerKey the scheduler request key
+   * @return true if allocation can proceed, false otherwise
+   *
+   * Source: AppSchedulingInfo.java:759-772
    */
   public boolean checkAllocation(NodeType type, SchedulerNode node,
       SchedulerRequestKey schedulerKey) {
@@ -804,7 +1031,17 @@ public class AppSchedulingInfo {
     ClusterMetrics.getMetrics().incrNumContainerAssigned();
   }
 
-  // Get AppPlacementAllocator by specified schedulerKey
+  /**
+   * Get AppPlacementAllocator by specified schedulerKey.
+   *
+   * @complexity Time: O(1) for ConcurrentHashMap.get() lookup.
+   *             Space: O(1) - returns existing reference.
+   *
+   * @param schedulerkey the scheduler request key
+   * @return the AppPlacementAllocator for the key, or null if not found
+   *
+   * Source: AppSchedulingInfo.java:807-812
+   */
   public <N extends SchedulerNode> AppPlacementAllocator<N> getAppPlacementAllocator(
       SchedulerRequestKey schedulerkey) {
     return (AppPlacementAllocator<N>) schedulerKeyToAppPlacementAllocator.get(
@@ -814,11 +1051,17 @@ public class AppSchedulingInfo {
   /**
    * Can delay to next?.
    *
+   * @complexity Time: O(1) for ConcurrentHashMap.get() lookup and
+   *             canDelayTo() check.
+   *             Space: O(1) - no additional allocation.
+   *
    * @param schedulerKey schedulerKey
    * @param resourceName resourceName
    *
    * @return If request exists, return {relaxLocality}
    *         Otherwise, return true.
+   *
+   * Source: AppSchedulingInfo.java:823-833
    */
   public boolean canDelayTo(
       SchedulerRequestKey schedulerKey, String resourceName) {
@@ -836,11 +1079,18 @@ public class AppSchedulingInfo {
    * Pre-check node to see if it satisfy the given schedulerKey and
    * scheduler mode.
    *
+   * @complexity Time: O(1) for ConcurrentHashMap.get() lookup plus O(c)
+   *             for precheckNode() constraint evaluation where c=number of
+   *             placement constraints.
+   *             Space: O(1) - no additional allocation beyond optional diagnostics.
+   *
    * @param schedulerKey schedulerKey
    * @param schedulerNode schedulerNode
    * @param schedulingMode schedulingMode
    * @param dcOpt optional diagnostics collector
    * @return can use the node or not.
+   *
+   * Source: AppSchedulingInfo.java:845-857
    */
   public boolean precheckNode(SchedulerRequestKey schedulerKey,
       SchedulerNode schedulerNode, SchedulingMode schedulingMode,
