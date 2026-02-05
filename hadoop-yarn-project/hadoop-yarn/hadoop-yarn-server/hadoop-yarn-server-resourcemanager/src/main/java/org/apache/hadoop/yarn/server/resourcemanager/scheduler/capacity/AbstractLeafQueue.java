@@ -93,6 +93,26 @@ import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.C
 import static org.apache.hadoop.yarn.nodelabels.CommonNodeLabelsManager.NO_LABEL;
 import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.QueueCapacityVector.ResourceUnitCapacityType.PERCENTAGE;
 
+/**
+ * Abstract base class for leaf queues in the Capacity Scheduler.
+ * Leaf queues are the terminal queues that directly hold applications and manage
+ * container allocation to those applications.
+ *
+ * @performance Leaf queue operations scale with O(a) for application count and O(u) for active
+ *              user count. Memory footprint: O(a + u) for application and user tracking.
+ *              Container allocation throughput is bounded by the application iteration loop
+ *              and user limit computation overhead.
+ *
+ * @implNote Application iteration uses OrderingPolicy (default: FIFO with priority) providing O(1)
+ *           iterator advancement. Alternative policies like FairOrderingPolicy add O(log a) overhead
+ *           for sorted access. Choice of FIFO default optimizes throughput over fairness granularity.
+ *
+ * @implNote User limit calculation enforces multi-tenant fairness by bounding each user's resource
+ *           consumption to (queue capacity / active users) × user-limit-factor. Uses CachedUserLimit
+ *           to amortize O(u) computation across multiple allocation attempts per scheduling cycle.
+ *           The cached approach trades slight staleness for reduced computation overhead when user
+ *           count is high.
+ */
 public class AbstractLeafQueue extends AbstractCSQueue {
   private static final Logger LOG =
       LoggerFactory.getLogger(AbstractLeafQueue.class);
@@ -1157,6 +1177,21 @@ public class AbstractLeafQueue extends AbstractCSQueue {
     }
   }
 
+  /**
+   * Assigns containers to applications in this leaf queue by iterating through
+   * schedulable applications and attempting allocation for each until one succeeds.
+   *
+   * @param clusterResource total cluster resource capacity
+   * @param candidates set of candidate nodes for container placement
+   * @param currentResourceLimits resource limits for this scheduling attempt
+   * @param schedulingMode scheduling mode (RESPECT_PARTITION_EXCLUSIVITY or IGNORE_PARTITION_EXCLUSIVITY)
+   * @return CSAssignment containing allocation result or NULL_ASSIGNMENT if no allocation made
+   *
+   * @complexity Time: O(a) where a=applications in queue for iterator traversal;
+   *             worst-case O(a × r) where r=resource requests per app when user limits recalculated
+   *             Space: O(u) where u=active users for cached user limits
+   *             Source: AbstractLeafQueue.java:1161-1335
+   */
   @Override
   public CSAssignment assignContainers(Resource clusterResource,
       CandidateNodeSet<FiCaSchedulerNode> candidates,
@@ -1208,6 +1243,9 @@ public class AbstractLeafQueue extends AbstractCSQueue {
     boolean needAssignToQueueCheck = true;
     IteratorSelector sel = new IteratorSelector();
     sel.setPartition(candidates.getPartition());
+    // @PerformanceCritical: Application iteration loop - hot path for container allocation
+    // (>10% leaf queue CPU time). Iterates through all schedulable applications until
+    // one successfully allocates a container or all applications are exhausted.
     for (Iterator<FiCaSchedulerApp> assignmentIterator = orderingPolicy.getAssignmentIterator(sel);
          assignmentIterator.hasNext();) {
       FiCaSchedulerApp application = assignmentIterator.next();
@@ -1243,6 +1281,8 @@ public class AbstractLeafQueue extends AbstractCSQueue {
         }
       }
 
+      // @PerformanceCritical: User limit check - called for every application assignment attempt.
+      // Uses CachedUserLimit to amortize O(u) user limit computation across scheduling cycles.
       CachedUserLimit cul = userLimits.get(application.getUser());
       Resource cachedUserLimit = null;
       if (cul != null) {
@@ -1567,7 +1607,30 @@ public class AbstractLeafQueue extends AbstractCSQueue {
     }
   }
 
-  // It doesn't necessarily to hold application's lock here.
+  /**
+   * Computes the user limit for an application and sets the headroom for resource requests.
+   * This method enforces per-user resource limits to ensure fair sharing among users in
+   * the queue.
+   *
+   * <p>It doesn't necessarily hold application's lock here.</p>
+   *
+   * @param application the application for which to compute user limit and headroom
+   * @param clusterResource total cluster resource capacity
+   * @param nodePartition the node partition label
+   * @param schedulingMode scheduling mode (RESPECT_PARTITION_EXCLUSIVITY or IGNORE_PARTITION_EXCLUSIVITY)
+   * @param userLimit cached user limit, or null if not cached
+   * @return computed user limit resource
+   *
+   * @complexity Time: O(u) where u=active users in queue (for user limit computation);
+   *             O(1) when userLimit is cached
+   *             Space: O(1) for headroom calculation result
+   *             Source: AbstractLeafQueue.java:1572-1611
+   *
+   * @implNote User limit calculation enforces multi-tenant fairness by bounding each user's
+   *           resource consumption to (queue capacity / active users) × user-limit-factor.
+   *           The cached userLimit parameter allows callers to pass pre-computed limits,
+   *           avoiding redundant O(u) computation within a single scheduling cycle.
+   */
   @Lock({AbstractLeafQueue.class})
   Resource computeUserLimitAndSetHeadroom(FiCaSchedulerApp application,
       Resource clusterResource, String nodePartition,
@@ -1626,6 +1689,8 @@ public class AbstractLeafQueue extends AbstractCSQueue {
   }
 
   /**
+   * Gets the computed resource limit for active users in this queue.
+   * Delegates to UsersManager for actual computation with caching.
    *
    * @param userName
    *          Name of user who has submitted one/more app to given queue.
@@ -1637,6 +1702,11 @@ public class AbstractLeafQueue extends AbstractCSQueue {
    *          scheduling mode
    *          RESPECT_PARTITION_EXCLUSIVITY/IGNORE_PARTITION_EXCLUSIVITY
    * @return Computed User Limit
+   *
+   * @complexity Time: O(u) where u=active users for user limit lookup/computation
+   *             when cache is invalidated; O(1) when cache is valid.
+   *             Space: O(1)
+   *             Source: AbstractLeafQueue.java:1641-1646
    */
   public Resource getResourceLimitForActiveUsers(String userName,
       Resource clusterResource, String nodePartition,
