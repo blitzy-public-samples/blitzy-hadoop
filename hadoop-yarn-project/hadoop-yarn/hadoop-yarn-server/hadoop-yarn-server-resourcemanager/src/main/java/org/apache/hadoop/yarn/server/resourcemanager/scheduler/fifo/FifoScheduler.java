@@ -101,6 +101,17 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentSkipListMap;
 
+/**
+ * FIFO scheduler for YARN ResourceManager.
+ * 
+ * <p>Implements a simple first-in-first-out scheduling policy where applications
+ * are scheduled in submission order. All applications share a single queue
+ * with no hierarchy or isolation between tenants.
+ * 
+ * @performance Linear scaling O(n × a) where n=nodes, a=applications; no queue hierarchy overhead.
+ *              FIFO is suitable for single-tenant/simple workloads but lacks multi-tenant isolation.
+ *              Simpler than CapacityScheduler and FairScheduler with O(1) queue lookup vs O(q × d) tree traversal.
+ */
 @LimitedPrivate("yarn")
 @Evolving
 @SuppressWarnings("unchecked")
@@ -125,6 +136,13 @@ public class FifoScheduler extends
   
   private final ResourceCalculator resourceCalculator = new DefaultResourceCalculator();
 
+  /**
+   * Single default queue for FIFO scheduler.
+   * 
+   * @implNote FIFO scheduler uses a single queue with no hierarchy, providing O(1) queue lookup
+   *           compared to CapacityScheduler's O(q × d) tree traversal. Trade-off: no multi-tenant
+   *           isolation, all applications share resources in submission order.
+   */
   private final Queue DEFAULT_QUEUE = new Queue() {
     @Override
     public String getQueueName() {
@@ -238,6 +256,15 @@ public class FifoScheduler extends
     super(FifoScheduler.class.getName());
   }
 
+  /**
+   * Initializes the scheduler with configuration.
+   * 
+   * @param conf the YARN configuration
+   * @complexity Time: O(1) initialization of ConcurrentSkipListMap and metrics.
+   *             Space: O(1) fixed overhead for scheduler data structures.
+   * @implNote Uses ConcurrentSkipListMap for applications to maintain FIFO ordering automatically
+   *           (sorted by ApplicationId which contains timestamp-based submission order).
+   */
   private synchronized void initScheduler(Configuration conf) {
     validateConf(conf);
     //Use ConcurrentSkipListMap because applications need to be ordered
@@ -320,6 +347,23 @@ public class FifoScheduler extends
     super.reinitialize(conf, rmContext);
   }
 
+  /**
+   * Allocate method for AM heartbeat processing.
+   * 
+   * <p>Processes allocation requests from ApplicationMasters, updates resource
+   * requests, handles container releases, and returns newly allocated containers.
+   * 
+   * @param applicationAttemptId the application attempt requesting allocation
+   * @param ask list of resource requests from the AM
+   * @param schedulingRequests list of scheduling requests
+   * @param release list of containers to release
+   * @param blacklistAdditions nodes to add to blacklist
+   * @param blacklistRemovals nodes to remove from blacklist
+   * @param updateRequests container update requests
+   * @return Allocation containing newly allocated containers and updated headroom
+   * @complexity Time: O(r + b) where r=resource requests to update, b=blacklist updates.
+   *             Space: O(a) where a=newly allocated containers returned in Allocation object.
+   */
   @Override
   public Allocation allocate(ApplicationAttemptId applicationAttemptId,
       List<ResourceRequest> ask, List<SchedulingRequest> schedulingRequests,
@@ -488,9 +532,18 @@ public class FifoScheduler extends
   }
   
   /**
-   * Heart of the scheduler...
+   * Heart of the scheduler - assigns containers to applications in FIFO order.
+   * 
+   * <p>Iterates through all applications in submission order (maintained by
+   * ConcurrentSkipListMap) and attempts to allocate containers on the given node.
    * 
    * @param node node on which resources are available to be allocated
+   * @complexity Time: O(a × k × c) where a=pending applications, k=scheduler keys per app, 
+   *             c=containers assignable per key. Worst case traverses all apps in ConcurrentSkipListMap.
+   *             Space: O(1) no additional allocations beyond container creation.
+   * @implNote Uses ConcurrentSkipListMap to preserve FIFO submission ordering (O(log a) insertion,
+   *           O(a) iteration). Simpler than CapacityScheduler/FairScheduler which require O(q × d)
+   *           queue hierarchy traversal plus fair share calculations.
    */
   private void assignContainers(FiCaSchedulerNode node) {
     LOG.debug("assignContainers:" +
@@ -498,6 +551,8 @@ public class FifoScheduler extends
         " #applications=" + applications.size());
 
     // Try to assign containers to applications in fifo order
+    // @PerformanceCritical: Main FIFO allocation loop - iterates all pending applications in submission order.
+    // Called on every node heartbeat (~1-10s interval). O(a) where a=pending applications.
     for (Map.Entry<ApplicationId, SchedulerApplication<FifoAppAttempt>> e : applications
         .entrySet()) {
       FifoAppAttempt application = e.getValue().getCurrentAppAttempt();
@@ -587,6 +642,20 @@ public class FifoScheduler extends
   }
 
 
+  /**
+   * Assigns containers on a specific node using locality preferences.
+   * 
+   * <p>Attempts container allocation in locality order: NODE_LOCAL first (best data locality),
+   * then RACK_LOCAL (same rack), finally OFF_SWITCH (any available node).
+   * 
+   * @param node the scheduler node to allocate containers on
+   * @param application the application attempt requesting containers
+   * @param schedulerKey the scheduler request key identifying the resource request
+   * @return total number of containers assigned across all locality levels
+   * @complexity Time: O(n + r + o) where n=node-local asks, r=rack-local asks, o=off-switch asks.
+   *             Each locality level is checked sequentially. Space: O(1) no additional allocations.
+   * @implNote Attempts locality in order: NODE_LOCAL → RACK_LOCAL → OFF_SWITCH for data locality optimization.
+   */
   private int assignContainersOnNode(FiCaSchedulerNode node, 
       FifoAppAttempt application, SchedulerRequestKey schedulerKey
   ) {
@@ -672,6 +741,22 @@ public class FifoScheduler extends
     return assignedContainers;
   }
 
+  /**
+   * Assigns specific containers to a node.
+   * 
+   * <p>Creates and allocates the requested number of containers (limited by node availability)
+   * and updates resource usage tracking for both the application and the node.
+   * 
+   * @param node the scheduler node to allocate containers on
+   * @param application the application attempt to assign containers to
+   * @param schedulerKey the scheduler request key for the allocation
+   * @param assignableContainers maximum number of containers to assign
+   * @param capability resource capability per container
+   * @param type the locality type for the assignment
+   * @return number of containers actually assigned
+   * @complexity Time: O(c) where c=assignedContainers for container creation loop.
+   *             Space: O(c) for Container and RMContainer objects created per assignment.
+   */
   private int assignContainer(FiCaSchedulerNode node, FifoAppAttempt application,
       SchedulerRequestKey schedulerKey, int assignableContainers,
       Resource capability, NodeType type) {
@@ -734,6 +819,17 @@ public class FifoScheduler extends
         Resources.subtract(getClusterResource(), usedResource));
   }
 
+  /**
+   * Handles scheduler events dispatched by RM.
+   * 
+   * <p>Central event handler for all scheduler events including node updates,
+   * application lifecycle events, and container management events.
+   * 
+   * @param event the scheduler event to handle
+   * @complexity Time: O(1) for most events (NODE_ADDED, APP_ADDED, etc.), 
+   *             O(c) for NODE_REMOVED where c=containers on removed node.
+   *             Space: O(1) for event processing.
+   */
   @Override
   public void handle(SchedulerEvent event) {
     switch(event.getType()) {
@@ -957,6 +1053,16 @@ public class FifoScheduler extends
     return usedResource;
   }
 
+  /**
+   * Handles node heartbeat updates and triggers container assignment.
+   * 
+   * <p>Called on every node heartbeat to process completed containers and
+   * trigger new container assignments if resources are available.
+   * 
+   * @param nm the node manager sending the heartbeat
+   * @complexity Time: O(a × k) where a=applications, k=scheduler keys during assignContainers().
+   *             Space: O(1) no additional allocations.
+   */
   @Override
   protected synchronized void nodeUpdate(RMNode nm) {
     super.nodeUpdate(nm);
@@ -968,6 +1074,8 @@ public class FifoScheduler extends
     }
 
     // A decommissioned node might be removed before we get here
+    // @PerformanceCritical: Called on every node heartbeat (~1-10s interval per node).
+    // Triggers assignContainers() which iterates all applications.
     if (node != null &&
         Resources.greaterThanOrEqual(resourceCalculator, getClusterResource(),
             node.getUnallocatedResource(), minimumAllocation)) {
