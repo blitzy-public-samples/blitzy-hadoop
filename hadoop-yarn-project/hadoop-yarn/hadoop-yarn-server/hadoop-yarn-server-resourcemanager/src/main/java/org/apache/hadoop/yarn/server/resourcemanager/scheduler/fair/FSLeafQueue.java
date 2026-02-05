@@ -48,6 +48,18 @@ import org.apache.hadoop.yarn.util.resource.Resources;
 
 import static org.apache.hadoop.yarn.util.resource.Resources.none;
 
+/**
+ * A leaf queue in the Fair Scheduler queue hierarchy. Leaf queues contain
+ * applications and manage their scheduling within the allocated fair share.
+ *
+ * @performance Linear scaling with number of runnable applications in queue.
+ *              Memory footprint: O(a_r + a_nr) where a_r=runnable apps,
+ *              a_nr=non-runnable apps. The primary data structures are
+ *              ArrayList for runnableApps and nonRunnableApps, providing
+ *              O(1) add and O(a) removal operations. Allocation performance
+ *              is dominated by fetchAppsWithDemand() which requires O(a log a)
+ *              for TreeSet construction with policy comparator sorting.
+ */
 @Private
 @Unstable
 public class FSLeafQueue extends FSQueue {
@@ -87,6 +99,16 @@ public class FSLeafQueue extends FSQueue {
     getMetrics().setAMResourceUsage(amResourceUsage);
   }
   
+  /**
+   * Adds an application attempt to this queue.
+   *
+   * @complexity Time: O(1) amortized for ArrayList.add operation
+   *             Space: O(1) per app added to either runnableApps or nonRunnableApps list
+   *             Source: FSLeafQueue.java:90-105
+   *
+   * @param app the application attempt to add
+   * @param runnable whether the app is runnable
+   */
   void addApp(FSAppAttempt app, boolean runnable) {
     writeLock.lock();
     try {
@@ -106,6 +128,14 @@ public class FSLeafQueue extends FSQueue {
   
   /**
    * Removes the given app from this queue.
+   *
+   * @complexity Time: O(a) worst-case for ArrayList.remove() which scans
+   *             the list to find and remove the app, where a=number of
+   *             runnable apps (or non-runnable apps in fallback case)
+   *             Space: O(1)
+   *             Source: FSLeafQueue.java:111-138
+   *
+   * @param app the application attempt to remove
    * @return whether or not the app was runnable
    */
   boolean removeApp(FSAppAttempt app) {
@@ -195,6 +225,14 @@ public class FSLeafQueue extends FSQueue {
     }
   }
 
+  /**
+   * Updates internal state including computing fair shares for applications.
+   *
+   * @complexity Time: O(a log a) for policy.computeShares() which sorts apps
+   *             for fair share calculation, where a=number of runnable apps
+   *             Space: O(a) for sorted collection during computation
+   *             Source: FSLeafQueue.java:199-206
+   */
   @Override
   void updateInternal() {
     readLock.lock();
@@ -207,6 +245,12 @@ public class FSLeafQueue extends FSQueue {
 
   /**
    * Compute the extent of fairshare starvation for a set of apps.
+   *
+   * @complexity Time: O(a) where a=number of apps with demand for starvation
+   *             iteration. Loop terminates early when no more starved apps found
+   *             (break at Resources.isNone check)
+   *             Space: O(1) for accumulator (fairShareStarvation resource clone)
+   *             Source: FSLeafQueue.java:214-228
    *
    * @param appsWithDemand apps to compute fairshare starvation for
    * @return aggregate fairshare starvation for all apps
@@ -307,6 +351,15 @@ public class FSLeafQueue extends FSQueue {
     return amResourceUsage;
   }
 
+  /**
+   * Updates the demand for this queue by aggregating demand from all apps.
+   *
+   * @complexity Time: O(a) where a=total number of apps (runnable + non-runnable)
+   *             for demand aggregation, iterating through both lists sequentially
+   *             Space: O(1) for accumulator (tmpDemand resource)
+   *             Note: Demand is capped at maxShare to limit allocation
+   *             Source: FSLeafQueue.java:311-336
+   */
   @Override
   public void updateDemand() {
     // Compute demand by iterating through apps in the queue
@@ -335,6 +388,18 @@ public class FSLeafQueue extends FSQueue {
     }
   }
 
+  /**
+   * Assigns a container to an application in this queue on the given node.
+   *
+   * @complexity Time: O(a) where a=number of runnable apps with demand in queue
+   *             for iteration through fetchAppsWithDemand result. Iteration stops
+   *             on first successful allocation or reservation (break at line 368)
+   *             Space: O(a) for TreeSet of apps sorted by policy comparator
+   *             Source: FSLeafQueue.java:339-372
+   *
+   * @param node the scheduler node to assign container on
+   * @return the resource assigned (or CONTAINER_RESERVED or none())
+   */
   @Override
   public Resource assignContainer(FSSchedulerNode node) {
     Resource assigned = none();
@@ -347,6 +412,9 @@ public class FSLeafQueue extends FSQueue {
       return assigned;
     }
 
+    // @PerformanceCritical: Application iteration during allocation - iterates through
+    // sorted runnable apps until container assigned (hot path during leaf queue allocation).
+    // This loop executes for every node heartbeat reaching this queue.
     for (FSAppAttempt sched : fetchAppsWithDemand(true)) {
       if (SchedulerAppUtils.isPlaceBlacklisted(sched, node, LOG)) {
         continue;
@@ -375,6 +443,20 @@ public class FSLeafQueue extends FSQueue {
    * Fetch the subset of apps that have unmet demand. When used for
    * preemption-related code (as opposed to allocation), omits apps that
    * should not be checked for starvation.
+   *
+   * @complexity Time: O(a log a) where a=number of runnable apps, due to
+   *             TreeSet insertion with policy comparator for each app with
+   *             pending demand. Each TreeSet.add() is O(log a) for maintaining
+   *             sorted order
+   *             Space: O(a) for returned TreeSet containing apps with pending demand
+   *             Source: FSLeafQueue.java:383-398
+   *
+   * @implNote Apps are sorted using policy.getComparator() which implements
+   *           fair share comparison (FairShareComparator or FifoAppComparator
+   *           depending on queue policy). TreeSet provides O(log a) insertion
+   *           maintaining sorted order by fair share deficit.
+   *           Trade-off: O(a log a) sorting cost vs O(a) unsorted iteration
+   *           ensures apps furthest from fair share get resources first.
    *
    * @param assignment whether the apps are for allocation containers, as
    *                   opposed to preemption calculations
@@ -422,6 +504,15 @@ public class FSLeafQueue extends FSQueue {
     this.lastTimeAtMinShare = lastTimeAtMinShare;
   }
 
+  /**
+   * Gets the number of runnable applications in this queue.
+   *
+   * @complexity Time: O(1) for ArrayList.size()
+   *             Space: O(1)
+   *             Source: FSLeafQueue.java:426-433
+   *
+   * @return the number of runnable applications
+   */
   @Override
   public int getNumRunnableApps() {
     readLock.lock();
