@@ -81,6 +81,37 @@ import org.apache.hadoop.yarn.util.resource.Resources;
 import static org.apache.hadoop.yarn.nodelabels.CommonNodeLabelsManager.NO_LABEL;
 import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration.getACLsForFlexibleAutoCreatedParentQueue;
 
+/**
+ * Abstract base class for parent queues in the Capacity Scheduler hierarchy.
+ * Parent queues contain child queues and are responsible for delegating
+ * container allocation requests to their children based on a configurable
+ * queue ordering policy.
+ *
+ * <p>This class implements the recursive descent container allocation pattern,
+ * where allocation requests flow from the root queue down through intermediate
+ * parent queues to leaf queues where actual application containers are assigned.
+ *
+ * @performance Parent queue operations scale with O(c) for child queue count per level.
+ *              Total allocation complexity: O(c^d) worst-case where c=avg children, d=depth;
+ *              typically O(q) where q=total queues due to early termination on successful allocation.
+ *              Memory overhead is O(c) for child queue list storage plus O(d) for recursion stack.
+ *              Source: AbstractParentQueue.java:783-1086
+ *
+ * @implNote Child queue ordering uses QueueOrderingPolicy with two main strategies:
+ *           1. PriorityUtilizationQueueOrderingPolicy: O(c log c) sort by (priority, utilization)
+ *              - Favors under-utilized queues for fair allocation
+ *           2. FairOrderingPolicy: O(c) iteration with precomputed fair shares
+ *           Capacity-based ordering (default) optimizes for queue entitlement vs submission order
+ *           which would favor FIFO behavior. Decision rationale: entitlement-based prevents starvation.
+ *           Source: AbstractParentQueue.java:1024-1027, QueueOrderingPolicy.java
+ *
+ * @implNote Uses recursive depth-first descent through queue hierarchy. Each parent queue
+ *           calls assignContainersToChildQueues() which iterates child queues sorted by policy.
+ *           Recursion depth bounded by queue hierarchy depth d (typically 3-5 levels).
+ *           Alternative BFS approach would require O(q) queue state storage vs O(d) stack for DFS.
+ *           DFS chosen for lower memory overhead and natural fit with hierarchical capacity limits.
+ *           Source: AbstractParentQueue.java:868-869, 1029-1086
+ */
 public abstract class AbstractParentQueue extends AbstractCSQueue {
   private static final Logger LOG =
       LoggerFactory.getLogger(AbstractParentQueue.class);
@@ -294,7 +325,16 @@ public abstract class AbstractParentQueue extends AbstractCSQueue {
    * | child-abs    | X                         | X                                   | Sum(children.minRes)<= |
    * |              |                           |                                     | parent.minRes          |
    * +--------------+---------------------------+-------------------------------------+------------------------+
-   * @param childQueues
+   *
+   * @complexity Time: O(c × l) where c=child queues, l=node labels for capacity validation;
+   *             worst-case O(c × l) when validating absolute resource configurations
+   *             or percentage capacity sums across all node labels.
+   *             Space: O(c) for child queue list storage; O(l) temporary for label iteration.
+   *             Source: AbstractParentQueue.java:299-406
+   *
+   * @param childQueues the collection of child queues to set
+   * @throws IOException if capacity validation fails (sum != 0 or 100%, or absolute
+   *         resources exceed parent limits)
    */
   void setChildQueues(Collection<CSQueue> childQueues) throws IOException {
     writeLock.lock();
@@ -779,6 +819,29 @@ public abstract class AbstractParentQueue extends AbstractCSQueue {
     return parent != null ? parent.getQueuePath() : "";
   }
 
+  /**
+   * Assigns containers to child queues by recursively descending through the queue hierarchy.
+   * This method implements the core container allocation logic for parent queues, delegating
+   * actual container assignment to leaf queues via recursive calls through child parent queues.
+   *
+   * <p>The method first validates queue accessibility for the target partition, then checks
+   * if additional resources are needed. If so, it iterates through child queues in priority
+   * order (determined by QueueOrderingPolicy) and attempts allocation until one succeeds
+   * or all children are exhausted.
+   *
+   * @complexity Time: O(c) where c=child queues for iteration; worst-case O(c × d) where d=queue depth
+   *             for recursive descent to leaf queues. In practice, allocation typically succeeds
+   *             early (O(1) to O(c) for first successful child), providing amortized O(d) per allocation.
+   *             Space: O(d) for recursion stack depth in queue hierarchy (typically 3-5 levels).
+   *             Additional O(1) for CSAssignment result objects per recursion level.
+   *             Source: AbstractParentQueue.java:783-959
+   *
+   * @param clusterResource the total cluster resource capacity
+   * @param candidates the candidate node set for container placement
+   * @param resourceLimits the resource limits for this queue
+   * @param schedulingMode the scheduling mode (RESPECT_PARTITION_EXCLUSIVITY or IGNORE)
+   * @return CSAssignment containing allocation result and metadata
+   */
   @Override
   public CSAssignment assignContainers(Resource clusterResource,
        CandidateNodeSet<FiCaSchedulerNode> candidates,
@@ -1021,11 +1084,55 @@ public abstract class AbstractParentQueue extends AbstractCSQueue {
     return new ResourceLimits(childLimit);
   }
 
+  /**
+   * Returns an iterator over child queues sorted according to the configured
+   * QueueOrderingPolicy for container allocation ordering.
+   *
+   * <p>The ordering policy determines which child queue gets priority for
+   * container allocation. Different policies have different complexity characteristics:
+   * - PriorityUtilizationQueueOrderingPolicy: Sorts by (priority, utilization) pairs
+   * - FairOrderingPolicy: Uses precomputed fair share ordering
+   *
+   * @complexity Time: O(c log c) for priority-based queue ordering via QueueOrderingPolicy
+   *             (comparison sort of c child queues); O(c) for utilization-based ordering
+   *             when queue list is pre-sorted or uses linear scan strategy.
+   *             Space: O(1) for iterator reference; actual sorting space depends on policy
+   *             implementation (typically O(c) for comparison sort auxiliary space).
+   *             Source: AbstractParentQueue.java:1024-1027, QueueOrderingPolicy.java
+   *
+   * @param partition the node partition label for which to get the allocation iterator
+   * @return Iterator over child queues in allocation priority order
+   */
   private Iterator<CSQueue> sortAndGetChildrenAllocationIterator(
       String partition) {
     return queueOrderingPolicy.getAssignmentIterator(partition);
   }
 
+  /**
+   * Attempts to assign containers to child queues in priority order as determined
+   * by the configured QueueOrderingPolicy. Iterates through children until one
+   * successfully allocates a container or all children have been tried.
+   *
+   * <p>This method implements the core child queue iteration logic, calculating
+   * appropriate resource limits for each child before delegation. The iteration
+   * uses early termination - returning immediately when a child successfully
+   * allocates, which provides good average-case performance.
+   *
+   * @complexity Time: O(c) where c=child queues for single allocation pass;
+   *             worst-case iterates all children when none can allocate.
+   *             Best-case O(1) when first child queue successfully allocates (early termination).
+   *             Average-case depends on queue utilization distribution; typically O(c/2) iterations.
+   *             Space: O(1) for assignment result and iterator references; O(d) recursively
+   *             when child queues are also parent queues (d=remaining hierarchy depth).
+   *             Source: AbstractParentQueue.java:1029-1086
+   *
+   * @param cluster the total cluster resource capacity
+   * @param candidates the candidate node set for container placement
+   * @param limits the resource limits for this parent queue
+   * @param schedulingMode the scheduling mode for partition handling
+   * @return CSAssignment containing the result from the first successful child allocation,
+   *         or NULL_ASSIGNMENT if no child could allocate
+   */
   private CSAssignment assignContainersToChildQueues(Resource cluster,
       CandidateNodeSet<FiCaSchedulerNode> candidates, ResourceLimits limits,
       SchedulingMode schedulingMode) {

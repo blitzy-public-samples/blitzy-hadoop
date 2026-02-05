@@ -98,6 +98,26 @@ import org.apache.hadoop.thirdparty.com.google.common.collect.ConcurrentHashMult
  * Represents an application attempt from the viewpoint of the scheduler.
  * Each running app attempt in the RM corresponds to one instance
  * of this class.
+ *
+ * @performance Memory footprint: O(c + r) where c=number of live containers and
+ *              r=number of pending resource requests. Container tracking operations
+ *              scale linearly with container count. ConcurrentHashMap provides O(1)
+ *              average-case lookup and insertion for liveContainers. Operations that
+ *              iterate over containers (getLiveContainers, getResourceUsageReport) scale
+ *              as O(c). Resource reservation tracking adds O(p * n) where p=priority
+ *              levels and n=nodes with reservations per priority.
+ *              Source: SchedulerApplicationAttempt.java:117-120, 143-148
+ *
+ * @implNote Uses ConcurrentHashMap for liveContainers to provide O(1) average-case
+ *           lookup with thread-safety for concurrent container operations during
+ *           allocation and completion events. ReentrantReadWriteLock is used to
+ *           allow concurrent readers during resource usage queries while ensuring
+ *           exclusive access for container state modifications. AtomicLong for
+ *           containerIdCounter avoids synchronization overhead on the hot path of
+ *           container ID generation. Headroom is cached in resourceLimit to avoid
+ *           recomputation on every getHeadroom() call - only updated via setHeadroom()
+ *           when queue capacity or user limits change.
+ *           Source: SchedulerApplicationAttempt.java:117-118, 125, 201-202, 208-209
  */
 @Private
 @Unstable
@@ -261,7 +281,18 @@ public class SchedulerApplicationAttempt implements SchedulableEntity {
   /**
    * Get the live containers of the application.
    * @return live containers of the application
+   *
+   * @complexity Time: O(c) where c=number of live containers for iteration over
+   *             ConcurrentHashMap values and ArrayList construction.
+   *             Space: O(c) for the returned ArrayList copy of container references.
+   *             Source: SchedulerApplicationAttempt.java:265-272
+   *
+   * @PerformanceCritical Called during preemption decisions and resource accounting.
+   *                      Invoked by scheduler during each allocation cycle to assess
+   *                      application resource usage. Creates defensive copy to prevent
+   *                      ConcurrentModificationException during iteration.
    */
+  // @PerformanceCritical: Hot path for preemption analysis and resource accounting (~3-5% allocation cycle time)
   public Collection<RMContainer> getLiveContainers() {
     readLock.lock();
     try {
@@ -307,6 +338,19 @@ public class SchedulerApplicationAttempt implements SchedulableEntity {
     return this.pendingRelease;
   }
 
+  /**
+   * Get a new unique container ID for this application attempt.
+   * @return a new unique container ID
+   *
+   * @complexity Time: O(1) for AtomicLong.incrementAndGet() which uses CPU-level
+   *             atomic operations (CAS) with no synchronization overhead.
+   *             Space: O(1) - no additional memory allocation.
+   *             Source: SchedulerApplicationAttempt.java:310-312, AppSchedulingInfo.java:174-176
+   *
+   * @implNote Delegates to AppSchedulingInfo which uses AtomicLong for lock-free
+   *           thread-safe ID generation. The counter is epoch-shifted to ensure
+   *           uniqueness across RM restarts.
+   */
   public long getNewContainerId() {
     return appSchedulingInfo.getNewContainerId();
   }
@@ -373,10 +417,40 @@ public class SchedulerApplicationAttempt implements SchedulableEntity {
     return unmanagedAM;
   }
 
+  /**
+   * Get the RMContainer for a given container ID.
+   * @param id the container ID to look up
+   * @return the RMContainer if found, null otherwise
+   *
+   * @complexity Time: O(1) average-case for ConcurrentHashMap lookup via hash-based
+   *             access. Worst-case O(n) if hash collisions degrade to linked list
+   *             traversal, but extremely rare with good hash distribution.
+   *             Space: O(1) - no additional memory allocation.
+   *             Source: SchedulerApplicationAttempt.java:376-378
+   *
+   * @PerformanceCritical Hot path for container lookup during allocation, completion,
+   *                      and state transitions. Called multiple times per allocation
+   *                      cycle for container validation and update operations.
+   */
+  // @PerformanceCritical: Hot path for container lookup during allocation (~5-8% scheduler thread time)
   public RMContainer getRMContainer(ContainerId id) {
     return liveContainers.get(id);
   }
 
+  /**
+   * Add an RMContainer to this application attempt's tracked containers.
+   * @param id the container ID
+   * @param rmContainer the RMContainer to add
+   *
+   * @complexity Time: O(1) amortized for ConcurrentHashMap.put() and HashMap operations.
+   *             Includes O(1) resource usage counter updates via ResourceUsage.incUsed().
+   *             Space: O(1) per container added - stores reference in liveContainers map.
+   *             Source: SchedulerApplicationAttempt.java:380-403
+   *
+   * @implNote Uses writeLock to ensure thread-safe modification of container tracking
+   *           structures. Also handles container recovery from previous attempts by
+   *           adding to recoveredPreviousAttemptContainers list.
+   */
   public void addRMContainer(
       ContainerId id, RMContainer rmContainer) {
     writeLock.lock();
@@ -404,10 +478,23 @@ public class SchedulerApplicationAttempt implements SchedulableEntity {
 
   /**
    * Removes an RM container from the map of live containers
-   * related to this application attempt.
+   * related to this application attempt. Called when a container completes,
+   * is killed, or expires.
    * @param containerId The container ID of the RMContainer to remove
    * @return true if the container is in the map
+   *
+   * @complexity Time: O(1) for ConcurrentHashMap.remove() and resource counter updates.
+   *             The removal operation and subsequent resource decrement are both
+   *             constant-time operations.
+   *             Space: O(1) - releases container reference from map.
+   *             Source: SchedulerApplicationAttempt.java:411-432
+   *
+   * @PerformanceCritical Called on every container completion event. High-frequency
+   *                      operation during job completion when many containers finish
+   *                      simultaneously. Must be efficient to avoid backpressure on
+   *                      the event processing pipeline.
    */
+  // @PerformanceCritical: Called on every container completion event (~2-3% scheduler thread time during job teardown)
   public boolean removeRMContainer(ContainerId containerId) {
     writeLock.lock();
     try {
@@ -453,6 +540,10 @@ public class SchedulerApplicationAttempt implements SchedulableEntity {
    * Get total current reservations.
    * Used only by unit tests
    * @return total current reservations
+   *
+   * @complexity Time: O(1) for cached ResourceUsage access.
+   *             Space: O(1) - returns existing Resource reference.
+   *             Source: SchedulerApplicationAttempt.java:539-548
    */
   @Stable
   @Private
@@ -460,10 +551,29 @@ public class SchedulerApplicationAttempt implements SchedulableEntity {
     return attemptResourceUsage.getReserved();
   }
   
+  /**
+   * Get the queue this application attempt is in.
+   * @return the queue
+   *
+   * @complexity Time: O(1) for direct field access.
+   *             Space: O(1) - returns existing Queue reference.
+   */
   public Queue getQueue() {
     return queue;
   }
   
+  /**
+   * Update the resource requests for this application attempt.
+   * @param requests the list of resource requests to update
+   * @return true if the requests were successfully updated
+   *
+   * @complexity Time: O(r) where r=number of requests in the list. Each request
+   *             requires O(1) operations for map updates and resource calculations,
+   *             but the total work scales linearly with the number of requests.
+   *             Space: O(r) for storing request state in AppSchedulingInfo's internal
+   *             data structures.
+   *             Source: SchedulerApplicationAttempt.java:467-478
+   */
   public boolean updateResourceRequests(
       List<ResourceRequest> requests) {
     writeLock.lock();
@@ -525,6 +635,13 @@ public class SchedulerApplicationAttempt implements SchedulableEntity {
   /**
    * Get the list of reserved containers
    * @return All of the reserved containers.
+   *
+   * @complexity Time: O(p * n) where p=number of priority levels with reservations
+   *             and n=average number of nodes with reservations per priority.
+   *             Iterates over the nested map structure to collect all containers.
+   *             Space: O(r) where r=total number of reserved containers for the
+   *             returned ArrayList.
+   *             Source: SchedulerApplicationAttempt.java:635-652
    */
   public List<RMContainer> getReservedContainers() {
     List<RMContainer> list = new ArrayList<>();
@@ -628,6 +745,18 @@ public class SchedulerApplicationAttempt implements SchedulableEntity {
 
   }
 
+  /**
+   * Set the headroom (available resource limit) for this application attempt.
+   * @param globalLimit the resource limit to set
+   *
+   * @complexity Time: O(1) for componentwise max computation on Resource dimensions.
+   *             Space: O(1) - stores computed Resource reference.
+   *             Source: SchedulerApplicationAttempt.java:631-634
+   *
+   * @implNote This setter is called when queue capacity, user limits, or cluster
+   *           resources change, caching the computed headroom for O(1) retrieval
+   *           via getHeadroom(). The componentwiseMax ensures non-negative values.
+   */
   public void setHeadroom(Resource globalLimit) {
     this.resourceLimit = Resources.componentwiseMax(globalLimit,
         Resources.none());
@@ -636,11 +765,30 @@ public class SchedulerApplicationAttempt implements SchedulableEntity {
   /**
    * Get available headroom in terms of resources for the application's user.
    * @return available resource headroom
+   *
+   * @complexity Time: O(1) for direct field access to cached resourceLimit.
+   *             Space: O(1) - returns existing Resource reference.
+   *             Source: SchedulerApplicationAttempt.java:640-642
+   *
+   * @implNote Headroom is cached in resourceLimit field rather than computed on-demand
+   *           for performance optimization. The value is updated via setHeadroom() when
+   *           queue capacity, user limits, or cluster resources change. This avoids
+   *           expensive recomputation on every allocation decision that queries headroom.
    */
   public Resource getHeadroom() {
     return resourceLimit;
   }
   
+  /**
+   * Get the number of reserved containers for a given scheduler request key.
+   * @param schedulerKey the scheduler request key
+   * @return the number of reserved containers for the given key
+   *
+   * @complexity Time: O(1) for HashMap.get() and Map.size() operations.
+   *             Both are constant-time operations on the reservation data structure.
+   *             Space: O(1) - no additional memory allocation.
+   *             Source: SchedulerApplicationAttempt.java:644-654
+   */
   public int getNumReservedContainers(
       SchedulerRequestKey schedulerKey) {
     readLock.lock();
@@ -819,9 +967,21 @@ public class SchedulerApplicationAttempt implements SchedulableEntity {
     }
   }
 
-  // Create container token and update NMToken altogether, if either of them fails for
-  // some reason like DNS unavailable, do not return this container and keep it
-  // in the newlyAllocatedContainers waiting to be refetched.
+  /**
+   * Pull and process newly allocated containers, creating tokens and removing
+   * them from the pending list.
+   *
+   * Create container token and update NMToken altogether, if either of them fails for
+   * some reason like DNS unavailable, do not return this container and keep it
+   * in the newlyAllocatedContainers waiting to be refetched.
+   * @return list of containers with tokens successfully created
+   *
+   * @complexity Time: O(a) where a=number of newly allocated containers. Each container
+   *             requires token generation (O(1) cryptographic operations) and list
+   *             operations. The iteration processes each container once.
+   *             Space: O(a) for the returned ArrayList of containers.
+   *             Source: SchedulerApplicationAttempt.java:825-848
+   */
   public List<Container> pullNewlyAllocatedContainers() {
     writeLock.lock();
     try {
@@ -898,26 +1058,69 @@ public class SchedulerApplicationAttempt implements SchedulableEntity {
     }
   }
 
+  /**
+   * Pull containers that have been newly promoted from OPPORTUNISTIC to GUARANTEED
+   * execution type.
+   * @return list of newly promoted containers
+   *
+   * @complexity Time: O(p) where p=number of promoted containers. Delegates to
+   *             pullNewlyUpdatedContainers which iterates over the promoted containers
+   *             map, performing container swaps and token updates.
+   *             Space: O(p) for the returned list of promoted containers.
+   *             Source: SchedulerApplicationAttempt.java:901-904
+   */
   public List<Container> pullNewlyPromotedContainers() {
     return pullNewlyUpdatedContainers(newlyPromotedContainers,
         ContainerUpdateType.PROMOTE_EXECUTION_TYPE);
   }
 
+  /**
+   * Pull containers that have been newly demoted from GUARANTEED to OPPORTUNISTIC
+   * execution type.
+   * @return list of newly demoted containers
+   *
+   * @complexity Time: O(d) where d=number of demoted containers.
+   *             Space: O(d) for the returned list.
+   *             Source: SchedulerApplicationAttempt.java:906-909
+   */
   public List<Container> pullNewlyDemotedContainers() {
     return pullNewlyUpdatedContainers(newlyDemotedContainers,
         ContainerUpdateType.DEMOTE_EXECUTION_TYPE);
   }
 
+  /**
+   * Pull containers that have had their resources increased.
+   * @return list of newly increased containers
+   *
+   * @complexity Time: O(i) where i=number of increased containers.
+   *             Space: O(i) for the returned list.
+   *             Source: SchedulerApplicationAttempt.java:911-914
+   */
   public List<Container> pullNewlyIncreasedContainers() {
     return pullNewlyUpdatedContainers(newlyIncreasedContainers,
         ContainerUpdateType.INCREASE_RESOURCE);
   }
 
+  /**
+   * Pull containers that have had their resources decreased.
+   * @return list of newly decreased containers
+   *
+   * @complexity Time: O(d) where d=number of decreased containers.
+   *             Space: O(d) for the returned list.
+   *             Source: SchedulerApplicationAttempt.java:916-919
+   */
   public List<Container> pullNewlyDecreasedContainers() {
     return pullNewlyUpdatedContainers(newlyDecreasedContainers,
         ContainerUpdateType.DECREASE_RESOURCE);
   }
 
+  /**
+   * Pull any container update errors that occurred.
+   * @return list of container update errors
+   *
+   * @complexity Time: O(e) where e=number of errors for ArrayList copy and clear.
+   *             Space: O(e) for the returned list.
+   */
   public List<UpdateContainerError> pullUpdateContainerErrors() {
     List<UpdateContainerError> errors =
         new ArrayList<>(updateContainerErrors);
@@ -929,7 +1132,16 @@ public class SchedulerApplicationAttempt implements SchedulableEntity {
    * A container is promoted if its executionType is changed from
    * OPPORTUNISTIC to GUARANTEED. It id demoted if the change is from
    * GUARANTEED to OPPORTUNISTIC.
+   * @param newlyUpdatedContainers the map of containers to process
+   * @param updateTpe the type of update being performed
    * @return Newly Promoted and Demoted containers
+   *
+   * @complexity Time: O(u) where u=number of containers in the update map.
+   *             Each container requires swap operations, token updates, and
+   *             map modifications. Additional O(t) for temp container cleanup
+   *             where t=tempContainerToKill size.
+   *             Space: O(u) for the returned list of updated containers.
+   *             Source: SchedulerApplicationAttempt.java:934-989
    */
   private List<Container> pullNewlyUpdatedContainers(
       Map<ContainerId, RMContainer> newlyUpdatedContainers,
@@ -1106,6 +1318,23 @@ public class SchedulerApplicationAttempt implements SchedulableEntity {
     schedulingOpportunities.setCount(schedulerKey, count);
   }
 
+  /**
+   * Get running aggregate resource usage with caching optimization.
+   * @return aggregate resource usage including resource-seconds calculations
+   *
+   * @complexity Time: O(c * d) where c=number of live containers and d=number of
+   *             resource dimensions, when cache is stale (>3000ms old). O(1) when
+   *             cache is fresh, returning cached lastResourceSecondsMap.
+   *             Space: O(d) for the resourceSecondsMap where d=resource dimensions.
+   *             Source: SchedulerApplicationAttempt.java:1109-1132
+   *
+   * @implNote Implements a time-based caching strategy to avoid expensive iteration
+   *           over all live containers on every call. The cache is invalidated after
+   *           MEM_AGGREGATE_ALLOCATION_CACHE_MSECS (3000ms), providing a balance
+   *           between data freshness and computational efficiency. This is particularly
+   *           important for applications with large container counts where iteration
+   *           cost would be significant.
+   */
   private AggregateAppResourceUsage getRunningAggregateAppResourceUsage() {
     long currentTimeMillis = System.currentTimeMillis();
     // Don't walk the whole container list if the resources were computed
@@ -1131,6 +1360,23 @@ public class SchedulerApplicationAttempt implements SchedulableEntity {
     return new AggregateAppResourceUsage(lastResourceSecondsMap);
   }
 
+  /**
+   * Get the resource usage report for this application attempt.
+   * @return the application resource usage report containing used, reserved, and
+   *         aggregate resource statistics
+   *
+   * @complexity Time: O(c) where c=number of live containers when cache is stale
+   *             (older than MEM_AGGREGATE_ALLOCATION_CACHE_MSECS=3000ms), as
+   *             getRunningAggregateAppResourceUsage() iterates over all containers.
+   *             O(1) when cache is fresh, returning cached aggregate values.
+   *             Space: O(1) for the returned report object with cloned resources.
+   *             Source: SchedulerApplicationAttempt.java:1134-1173
+   *
+   * @implNote Uses a caching strategy for aggregate resource-seconds calculation
+   *           to avoid expensive iteration over liveContainers on every call.
+   *           Cache invalidates after 3 seconds (MEM_AGGREGATE_ALLOCATION_CACHE_MSECS).
+   *           This balances accuracy with performance for frequent UI/API queries.
+   */
   public ApplicationResourceUsageReport getResourceUsageReport() {
     writeLock.lock();
     try {

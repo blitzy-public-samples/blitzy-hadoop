@@ -210,6 +210,17 @@ import org.apache.hadoop.thirdparty.com.google.common.net.InetAddresses;
  * DistributedFileSystem, which uses DFSClient to handle
  * filesystem tasks.
  *
+ * @performance Central HDFS client engine with O(1) RPC operations to NameNode
+ *              for metadata; block location caching reduces repeated NN lookups.
+ *              Scalability: Client-side caching and connection pooling (PeerCache)
+ *              optimize DataNode connectivity; encryption key lifecycle managed
+ *              via KeyProviderCache.
+ *
+ * @implNote Block location caching via prefetch mechanism (dfs.client.read.prefetch.size)
+ *           reduces NameNode RPC load. Trade-off: Accepts stale block locations
+ *           temporarily for reduced NameNode load. PeerCache pools DataNode connections
+ *           to amortize connection setup cost across multiple read/write operations.
+ *
  ********************************************************/
 @InterfaceAudience.Private
 public class DFSClient implements java.io.Closeable, RemotePeerFactory,
@@ -903,6 +914,10 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
    * @param start starting offset.
    * @return LocatedBlocks
    * @throws IOException
+   *
+   * @complexity Time: O(1) RPC call to NameNode + O(b) deserialization where b = blocks
+   *             returned within prefetch size; Space: O(b) for LocatedBlocks result.
+   *             Source: DFSClient.java:907-910
    */
   public LocatedBlocks getLocatedBlocks(String src, long start)
       throws IOException {
@@ -912,6 +927,11 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
   /**
    * This is just a wrapper around callGetBlockLocations, but non-static so that
    * we can stub it out for tests.
+   *
+   * @complexity Time: O(1) RPC call to NameNode + O(b) deserialization where b = blocks
+   *             returned in the requested range; Space: O(b) for LocatedBlocks result.
+   *             Wrapper around callGetBlockLocations with tracing support.
+   *             Source: DFSClient.java:917-922
    */
   @VisibleForTesting
   public LocatedBlocks getLocatedBlocks(String src, long start, long length)
@@ -969,6 +989,12 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
    * Please refer to
    * {@link FileSystem#getFileBlockLocations(FileStatus, long, long)}
    * for more details.
+   *
+   * @complexity Time: O(b) where b = number of blocks in requested range; iterates over
+   *             LocatedBlocks to create HdfsBlockLocation array.
+   *             Space: O(b * r) where r = replication factor for block location storage;
+   *             allocates HdfsBlockLocation array wrapping each LocatedBlock.
+   *             Source: DFSClient.java:973-986
    */
   public BlockLocation[] getBlockLocations(String src, long start,
       long length) throws IOException {
@@ -1763,6 +1789,12 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
    *         or null if file not found
    *
    * @see ClientProtocol#getFileInfo(String) for description of exceptions
+   *
+   * @complexity Time: O(1) single RPC call to NameNode; direct metadata lookup
+   *             with exception unwrapping.
+   *             Space: O(1) for HdfsFileStatus response object containing file
+   *             metadata (path, length, replication, blocksize, permissions, etc.).
+   *             Source: DFSClient.java:1767-1776
    */
   public HdfsFileStatus getFileInfo(String src) throws IOException {
     checkOpen();

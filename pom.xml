@@ -125,6 +125,8 @@ xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/x
     <maven-compiler-plugin.version>3.10.1</maven-compiler-plugin.version>
     <cyclonedx.version>2.9.1</cyclonedx.version>
     <docker-maven-plugin.version>0.29.0</docker-maven-plugin.version>
+    <!-- maven-surefire-plugin version for performance validation tests -->
+    <maven-surefire-plugin.version>3.5.3</maven-surefire-plugin.version>
 
     <shell-executable>bash</shell-executable>
 
@@ -537,6 +539,31 @@ xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/x
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-compiler-plugin</artifactId>
           <version>${maven-compiler-plugin.version}</version>
+        </plugin>
+        <!--
+          Performance Validation Test Configuration
+          Configures maven-surefire-plugin for running performance documentation
+          validation tests located in tests/performance_validation/ directory.
+          
+          These tests validate documented algorithmic complexity claims by measuring
+          execution time scaling across multiple input sizes (100, 1000, 10000 elements).
+          
+          Configuration per Agent Action Plan Section 0.5.4:
+          - Includes pattern targets PerformanceDoc*ValidationTest.java files
+          - JVM heap set to 2GB for large dataset validation tests
+          - 5-minute timeout per forked process for comprehensive complexity testing
+        -->
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>${maven-surefire-plugin.version}</version>
+          <configuration>
+            <includes>
+              <include>**/PerformanceDoc*ValidationTest.java</include>
+            </includes>
+            <argLine>-Xmx2g</argLine>
+            <forkedProcessTimeoutInSeconds>300</forkedProcessTimeoutInSeconds>
+          </configuration>
         </plugin>
       </plugins>
     </pluginManagement>

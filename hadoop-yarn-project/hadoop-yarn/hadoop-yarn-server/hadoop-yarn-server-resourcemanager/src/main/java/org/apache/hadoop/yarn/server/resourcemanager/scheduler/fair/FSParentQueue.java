@@ -41,6 +41,19 @@ import org.apache.hadoop.yarn.util.resource.Resources;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ActiveUsersManager;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplicationAttempt;
 
+/**
+ * Represents a parent queue in the fair scheduler queue hierarchy.
+ * Parent queues contain child queues and aggregate resource demands
+ * from their descendants.
+ *
+ * @performance Scaling: O(c × d) where c=child queues at each level, d=hierarchy depth.
+ *              Memory: O(c) where c=child queues stored in ArrayList.
+ *              Concurrency: ReentrantReadWriteLock provides concurrent read access
+ *              during queue hierarchy traversal while ensuring exclusive write access
+ *              for modifications. Read operations (getDemand, getChildQueues, getNumRunnableApps)
+ *              scale linearly with concurrent readers.
+ *              Source: FSParentQueue.java:44-332
+ */
 @Private
 @Unstable
 public class FSParentQueue extends FSQueue {
@@ -91,6 +104,19 @@ public class FSParentQueue extends FSQueue {
     }
   }
 
+  /**
+   * Updates fair shares for this queue and recursively for all child queues.
+   * Calls policy.computeShares() to calculate fair share distribution among
+   * children, then propagates updates down the hierarchy.
+   *
+   * @complexity Time: O(c × d × a) worst-case where c=child queues at this level,
+   *             d=max depth of subtree, a=apps in leaf queues.
+   *             Calls policy.computeShares() O(c log c) for sorting children by
+   *             weight/demand, then recursively calls childQueue.updateInternal()
+   *             for each child queue.
+   *             Space: O(d) stack depth for recursive traversal through queue hierarchy.
+   *             Source: FSParentQueue.java:95-106
+   */
   @Override
   void updateInternal() {
     readLock.lock();
@@ -105,6 +131,18 @@ public class FSParentQueue extends FSQueue {
     }
   }
 
+  /**
+   * Recomputes steady fair shares for this queue and recursively for all
+   * child parent queues. Steady shares represent the share a queue would
+   * receive if all queues were active.
+   *
+   * @complexity Time: O(c × d) where c=total child queues across all levels,
+   *             d=hierarchy depth. Performs recursive traversal calling
+   *             computeSteadyShares at each parent level, which involves
+   *             O(c log c) sorting per level.
+   *             Space: O(d) stack depth for recursive traversal.
+   *             Source: FSParentQueue.java:108-122
+   */
   void recomputeSteadyShares() {
     readLock.lock();
     try {
@@ -121,6 +159,16 @@ public class FSParentQueue extends FSQueue {
     }
   }
 
+  /**
+   * Returns the cached demand resource for this queue.
+   * Creates a new Resource instance to prevent external modification.
+   *
+   * @complexity Time: O(1) for cached demand access with defensive copy creation.
+   *             Space: O(1) for single Resource object allocation.
+   *             Source: FSParentQueue.java:125-132
+   *
+   * @return a new Resource instance containing this queue's demand
+   */
   @Override
   public Resource getDemand() {
     readLock.lock();
@@ -131,6 +179,17 @@ public class FSParentQueue extends FSQueue {
     }
   }
 
+  /**
+   * Updates the demand for this queue by aggregating demands from all
+   * child queues. Recursively propagates updateDemand() calls down the
+   * hierarchy and sums up child demands, capped by maxShare.
+   *
+   * @complexity Time: O(c × d × a) where c=children at this level, d=depth of subtree,
+   *             a=apps in leaf queues. Each child.updateDemand() recurses into subtree,
+   *             aggregating demands from all descendant applications.
+   *             Space: O(d) stack depth for recursive traversal through queue hierarchy.
+   *             Source: FSParentQueue.java:135-160
+   */
   @Override
   public void updateDemand() {
     // Compute demand by iterating through apps in the queue
@@ -189,6 +248,31 @@ public class FSParentQueue extends FSQueue {
     return userAcls;
   }
 
+  /**
+   * Attempts to assign a container to one of the child queues on the given node.
+   * Child queues are sorted by the scheduling policy comparator and tried in order
+   * until one succeeds or all fail.
+   *
+   * @complexity Time: O(c × a) worst-case where c=child queues, a=average apps per leaf queue
+   *             for recursive child queue traversal during container assignment.
+   *             O(c log c) for TreeSet sorting of child queues by policy comparator.
+   *             O(c) for iteration through sorted children until assignment succeeds.
+   *             Total: O(c log c) + O(c × a) = O(c × a) dominated by recursive traversal.
+   *             Note: Iteration stops on first successful allocation (break at line 236).
+   *             Space: O(c) for TreeSet copy of child queues used for sorted iteration.
+   *             Source: FSParentQueue.java:193-231
+   *
+   * @implNote Child queues are sorted using policy.getComparator() before iteration.
+   *           TreeSet ensures queues furthest below fair share are tried first,
+   *           implementing fair scheduling semantics. Trade-off: O(c log c) sorting
+   *           overhead per assignment vs O(c) unsorted iteration. The sorting cost
+   *           is accepted to ensure fairness in resource allocation order.
+   *           Child queue locking is intentionally avoided (lines 205-212) to prevent
+   *           performance degradation from lock contention during high-throughput scheduling.
+   *
+   * @param node the scheduler node to assign a container on
+   * @return the resources assigned, or Resources.none() if no assignment was made
+   */
   @Override
   public Resource assignContainer(FSSchedulerNode node) {
     Resource assigned = Resources.none();
@@ -210,6 +294,7 @@ public class FSParentQueue extends FSQueue {
     // We do not have to handle the queue removal case as a queue must be
     // empty before removal. Assigning an application to a queue and removal of
     // that queue both need the scheduler lock.
+    // @PerformanceCritical: TreeSet creation and sorting (O(c log c)) occurs on every assignment
     TreeSet<FSQueue> sortedChildQueues = new TreeSet<>(policy.getComparator());
     readLock.lock();
     try {
@@ -230,6 +315,17 @@ public class FSParentQueue extends FSQueue {
     return assigned;
   }
 
+  /**
+   * Returns an immutable copy of the child queues list.
+   * The immutable copy prevents external modification while allowing
+   * safe iteration without holding locks.
+   *
+   * @complexity Time: O(c) for ImmutableList copy where c=number of child queues.
+   *             Space: O(c) for returned immutable copy of child queue references.
+   *             Source: FSParentQueue.java:234-241
+   *
+   * @return an immutable list of child queues
+   */
   @Override
   public List<FSQueue> getChildQueues() {
     readLock.lock();
@@ -240,6 +336,14 @@ public class FSParentQueue extends FSQueue {
     }
   }
 
+  /**
+   * Increments the count of runnable applications in this parent queue.
+   * Called when a new application becomes runnable in a descendant leaf queue.
+   *
+   * @complexity Time: O(1) for counter increment operation.
+   *             Space: O(1) no additional allocations.
+   *             Source: FSParentQueue.java:243-250
+   */
   void incrementRunnableApps() {
     writeLock.lock();
     try {
@@ -249,6 +353,14 @@ public class FSParentQueue extends FSQueue {
     }
   }
   
+  /**
+   * Decrements the count of runnable applications in this parent queue.
+   * Called when an application is no longer runnable in a descendant leaf queue.
+   *
+   * @complexity Time: O(1) for counter decrement operation.
+   *             Space: O(1) no additional allocations.
+   *             Source: FSParentQueue.java:252-259
+   */
   void decrementRunnableApps() {
     writeLock.lock();
     try {
@@ -258,6 +370,16 @@ public class FSParentQueue extends FSQueue {
     }
   }
 
+  /**
+   * Returns the cached count of runnable applications in this parent queue
+   * and all descendant queues.
+   *
+   * @complexity Time: O(1) for cached count access.
+   *             Space: O(1) returns primitive int value.
+   *             Source: FSParentQueue.java:262-269
+   *
+   * @return the number of runnable applications
+   */
   @Override
   public int getNumRunnableApps() {
     readLock.lock();

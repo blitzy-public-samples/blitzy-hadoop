@@ -52,6 +52,18 @@ import org.apache.hadoop.util.Time;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * Implementation of the shuffle scheduler that manages the fetching of map
+ * outputs during the reduce phase. Coordinates host selection, failure
+ * tracking, and retry scheduling for efficient data transfer.
+ *
+ * @performance Scheduling operations scale O(1) per event; total scheduling
+ *              overhead is O(m) where m=number of map tasks. DelayQueue-based
+ *              penalty mechanism provides O(log p) insert/remove for p
+ *              penalized hosts. Host lookup via HashMap provides O(1) amortized
+ *              access. Memory footprint scales linearly with number of unique
+ *              hosts and map tasks tracked.
+ */
 @InterfaceAudience.Private
 @InterfaceStability.Unstable
 public class ShuffleSchedulerImpl<K,V> implements ShuffleScheduler<K,V> {
@@ -145,6 +157,28 @@ public class ShuffleSchedulerImpl<K,V> implements ShuffleScheduler<K,V> {
         MRJobConfig.DEFAULT_MAX_SHUFFLE_FETCH_HOST_FAILURES);
   }
 
+  /**
+   * Interprets a TaskCompletionEvent and dispatches to the appropriate handler
+   * based on the task status. Routes successful completions to add the map
+   * output for fetching, while failed/obsolete tasks are marked accordingly.
+   *
+   * @param event the task completion event containing status and location info
+   *
+   * @complexity Time: O(1) for event dispatch based on task status switch -
+   *             constant time operation that routes to appropriate handler
+   *             (addKnownMapOutput, obsoleteMapOutput, or tipFailed) based on
+   *             TaskCompletionEvent status. URI parsing is O(k) where k is URL
+   *             length (bounded constant in practice).
+   *             Space: O(1) per event - no dynamic allocations beyond
+   *             method-local variables; URI object creation is temporary.
+   *
+   * @implNote Uses switch-based dispatch for O(1) routing instead of if-else
+   *           chain; TaskCompletionEvent status enumeration ensures all cases
+   *           handled. Fall-through for FAILED/KILLED/OBSOLETE cases is
+   *           intentional as all three require the same obsoleteMapOutput
+   *           handling. The SUCCEEDED path performs the most work including
+   *           URI construction and map output registration.
+   */
   @Override
   public void resolve(TaskCompletionEvent event) {
     switch (event.getTaskStatus()) {
@@ -408,6 +442,25 @@ public class ShuffleSchedulerImpl<K,V> implements ShuffleScheduler<K,V> {
     }
   }
 
+  /**
+   * Registers a known map output location for fetching. Associates the map
+   * task attempt with its hosting node and marks the host as pending if it
+   * has available map outputs ready for retrieval.
+   *
+   * @param hostName the unique identifier for the host (hostname:port format)
+   * @param hostUrl the base URL for fetching map outputs from this host
+   * @param mapId the task attempt ID of the completed map task
+   *
+   * @complexity Time: O(1) amortized for HashMap get/put operations on
+   *             mapLocations; includes MapHost creation if not cached.
+   *             HashMap operations are O(1) average case with good hash
+   *             distribution. MapHost.addKnownMap() is O(1) ArrayList add.
+   *             HashSet.add() for pendingHosts is O(1) amortized.
+   *             Space: O(1) per map output reference stored in MapHost's
+   *             internal list; HashMap entry created only for new hosts
+   *             (O(1) per unique host). Total space across all calls is
+   *             O(h + m) where h=unique hosts and m=map outputs.
+   */
   public synchronized void addKnownMapOutput(String hostName,
                                              String hostUrl,
                                              TaskAttemptID mapId) {

@@ -81,6 +81,26 @@ import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.Q
 /**
  * Provides implementation of {@code CSQueue} methods common for every queue class in Capacity
  * Scheduler.
+ *
+ * @performance Queue operations use O(1) lookups for precomputed capacities and cached resource usage.
+ *              Memory footprint: O(l) where l=number of node labels for per-label capacity tracking.
+ *              Traversal to root: O(d) where d=queue depth in hierarchy.
+ *              Source: AbstractCSQueue.java:85-170
+ *
+ * @implNote Capacity calculations use precomputed values stored in QueueCapacities/QueueResourceQuotas
+ *           rather than on-demand computation. This trades O(q) memory for O(1) lookup time during
+ *           scheduling decisions. Alternative on-demand approach would save memory but incur O(d)
+ *           traversal cost per capacity check where d=queue depth.
+ *           Absolute resource mode: Direct resource values stored
+ *           Percentage mode: Percentages stored, effective resources computed on cluster update
+ *           Weight mode: Weights stored, resources computed proportionally on cluster update
+ *
+ * @implNote Uses ReentrantReadWriteLock for queue state protection:
+ *           - readLock: Capacity queries, resource usage reads, state checks (concurrent readers allowed)
+ *           - writeLock: Capacity updates, queue reinitialize, state transitions
+ *           This enables high-throughput reads during scheduling while serializing mutations.
+ *           Decision rationale: Most operations are reads during allocation; writes only occur on
+ *           configuration changes or cluster resource updates.
  */
 public abstract class AbstractCSQueue implements CSQueue {
   private static final Logger LOG =
@@ -187,6 +207,14 @@ public abstract class AbstractCSQueue implements CSQueue {
         queueContext.getConfiguration(), this.queueNodeLabelsSettings.getConfiguredNodeLabels());
   }
 
+  /**
+   * {@inheritDoc}
+   *
+   * @complexity Time: O(1) for cached path reference from QueuePath object;
+   *             O(d) where d=queue depth if full path needs construction
+   *             Space: O(d) for path string storage where d=queue depth
+   *             Source: AbstractCSQueue.java:210-213
+   */
   @Override
   public String getQueuePath() {
     return queuePath.getFullPath();
@@ -227,6 +255,13 @@ public abstract class AbstractCSQueue implements CSQueue {
     return queueCapacities.getUsedCapacity();
   }
 
+  /**
+   * {@inheritDoc}
+   *
+   * @complexity Time: O(1) for cached used resources access via CSQueueUsageTracker
+   *             Space: O(1) - returns reference to tracked ResourceUsage
+   *             Source: AbstractCSQueue.java:258-261
+   */
   @Override
   public Resource getUsedResources() {
     return usageTracker.getQueueUsage().getUsed();
@@ -256,6 +291,13 @@ public abstract class AbstractCSQueue implements CSQueue {
     return this.queuePath.getLeafName();
   }
 
+  /**
+   * {@inheritDoc}
+   *
+   * @complexity Time: O(1) for cached parent reference
+   *             Space: O(1)
+   *             Source: AbstractCSQueue.java:287-290
+   */
   @Override
   public CSQueue getParent() {
     return parent;
@@ -616,6 +658,13 @@ public abstract class AbstractCSQueue implements CSQueue {
     return capacityConfigType;
   }
 
+  /**
+   * {@inheritDoc}
+   *
+   * @complexity Time: O(1) for precomputed capacity lookup from QueueResourceQuotas
+   *             Space: O(1) - returns cloned Resource object
+   *             Source: AbstractCSQueue.java:661-665
+   */
   @Override
   public Resource getEffectiveCapacity(String label) {
     return Resources
@@ -629,6 +678,13 @@ public abstract class AbstractCSQueue implements CSQueue {
         queueAllocationSettings.getMinimumAllocation());
   }
 
+  /**
+   * {@inheritDoc}
+   *
+   * @complexity Time: O(1) for precomputed max capacity lookup from QueueResourceQuotas
+   *             Space: O(1) - returns cloned Resource object
+   *             Source: AbstractCSQueue.java:681-685
+   */
   @Override
   public Resource getEffectiveMaxCapacity(String label) {
     return Resources
@@ -765,6 +821,14 @@ public abstract class AbstractCSQueue implements CSQueue {
     return queueCapacities;
   }
 
+  /**
+   * Returns the resource usage tracker for this queue.
+   *
+   * @return the ResourceUsage object tracking this queue's resource consumption
+   * @complexity Time: O(1) for cached resource usage via CSQueueUsageTracker
+   *             Space: O(1) - returns reference to tracked ResourceUsage
+   *             Source: AbstractCSQueue.java:824-827
+   */
   @Private
   public ResourceUsage getQueueResourceUsage() {
     return usageTracker.getQueueUsage();
@@ -813,6 +877,15 @@ public abstract class AbstractCSQueue implements CSQueue {
     return getEffectiveMaxCapacity(nodePartition);
   }
 
+  /**
+   * Checks whether this queue has any child queues.
+   *
+   * @return true if the queue has one or more child queues, false otherwise
+   * @complexity Time: O(1) for null/empty check on cached child queue list
+   *             Space: O(1)
+   *             Note: Relies on getChildQueues() which returns O(1) for cached list
+   *             Source: AbstractCSQueue.java:880-884
+   */
   @VisibleForTesting
   boolean hasChildQueues() {
     List<CSQueue> childQueues = getChildQueues();

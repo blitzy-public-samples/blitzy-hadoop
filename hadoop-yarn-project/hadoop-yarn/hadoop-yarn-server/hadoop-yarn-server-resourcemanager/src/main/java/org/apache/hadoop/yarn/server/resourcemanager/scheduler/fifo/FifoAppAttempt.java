@@ -39,21 +39,71 @@ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.fica.FiCaS
 
 import org.apache.hadoop.yarn.server.scheduler.SchedulerRequestKey;
 
+/**
+ * Scheduler-side representation of an application attempt for the FIFO scheduler.
+ * Extends FiCaSchedulerApp to provide FIFO-specific container allocation behavior.
+ * 
+ * @performance Container tracking operations are O(c) where c=live containers.
+ *              Simple FIFO ordering requires no fair share calculations - O(1) priority comparisons
+ *              compared to FairScheduler's O(log a) weighted fair share computations.
+ * @implNote Minimal extension of FiCaSchedulerApp - relies on parent class for most attempt
+ *           tracking. FIFO ordering is maintained by FifoScheduler's ConcurrentSkipListMap,
+ *           not by per-attempt logic.
+ */
 public class FifoAppAttempt extends FiCaSchedulerApp {
   private static final Logger LOG =
       LoggerFactory.getLogger(FifoAppAttempt.class);
 
+  /**
+   * Constructs a new FIFO application attempt.
+   * 
+   * @param appAttemptId the application attempt ID
+   * @param user the submitting user
+   * @param queue the queue (always DEFAULT_QUEUE for FIFO)
+   * @param activeUsersManager manager for tracking active users
+   * @param rmContext the RM context
+   * @complexity Time: O(1) for direct field initialization via super constructor.
+   *             Space: O(1) fixed overhead per attempt plus parent class allocations.
+   */
   FifoAppAttempt(ApplicationAttemptId appAttemptId, String user,
       Queue queue, ActiveUsersManager activeUsersManager,
       RMContext rmContext) {
     super(appAttemptId, user, queue, activeUsersManager, rmContext);
   }
 
+  /**
+   * Allocates a container to this application attempt on the specified node.
+   * 
+   * @param type the locality type (NODE_LOCAL, RACK_LOCAL, OFF_SWITCH)
+   * @param node the scheduler node for allocation
+   * @param schedulerKey the scheduler request key
+   * @param container the container being allocated
+   * @return RMContainer if allocation succeeded, null otherwise
+   * 
+   * @complexity Time: O(1) amortized for container allocation:
+   *             - O(1) for isStopped check
+   *             - O(1) for getOutstandingAsksCount lookup (ConcurrentHashMap)
+   *             - O(1) for RMContainerImpl construction
+   *             - O(1) for liveContainers.put (ConcurrentHashMap)
+   *             - O(1) for appSchedulingInfo.allocate
+   *             - O(1) for attemptResourceUsage.incUsed
+   *             Space: O(1) per container - creates RMContainerImpl object
+   * 
+   * @implNote Simple FIFO allocation with no fair share calculations or queue hierarchy traversal.
+   *           Contrast with FairScheduler which requires O(log a) weighted fair share computation
+   *           and CapacityScheduler which requires O(q × d) queue capacity checks.
+   *           Uses writeLock for thread-safety during allocation - ensures atomic container assignment.
+   * 
+   * @PerformanceCritical: Called for every container allocation in the FIFO scheduler.
+   *                       Hot path during scheduling cycles (~1-10s per node heartbeat).
+   */
   public RMContainer allocate(NodeType type, FiCaSchedulerNode node,
       SchedulerRequestKey schedulerKey, Container container) {
 
     writeLock.lock();
     try {
+      // @PerformanceCritical: Container allocation hot path - executed for every container assignment.
+      // O(1) operations: state check, outstanding ask lookup, RMContainer creation, map insertion.
       if (isStopped) {
         return null;
       }
@@ -64,6 +114,9 @@ public class FifoAppAttempt extends FiCaSchedulerApp {
         return null;
       }
 
+      // @implNote: RMContainerImpl creation is O(1) - simple field initialization.
+      // Container tracking via liveContainers (ConcurrentHashMap) provides O(1) put/get.
+      // appSchedulingInfo.allocate updates pending request counts in O(1) amortized.
       // Create RMContainer
       RMContainer rmContainer = new RMContainerImpl(container,
           schedulerKey, this.getApplicationAttemptId(), node.getNodeID(),

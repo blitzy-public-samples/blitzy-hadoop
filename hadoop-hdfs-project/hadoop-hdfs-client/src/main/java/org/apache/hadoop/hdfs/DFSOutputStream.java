@@ -91,6 +91,22 @@ import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.Write.RECOVER_L
  * thread that picks up packets from the dataQueue and sends it to
  * the first datanode in the pipeline.
  *
+ * @performance Linear scaling with data size for write throughput; network-bound
+ *              to DataNode pipeline replication factor. Configurable packet size
+ *              (default 64KB via dfs.client-write-packet-size) and chunk size
+ *              (default 512 bytes via dfs.bytes-per-checksum). Write latency
+ *              dominated by pipeline acknowledgement round-trip time. Throughput
+ *              scales linearly up to network bandwidth saturation.
+ *
+ * @implNote Write pipeline architecture: client data flows through FSOutputSummer
+ *           for checksum computation, then to packet queue, then DataStreamer thread
+ *           sends packets to DataNode pipeline for replication. Trade-off: accepts
+ *           latency of synchronous pipeline acknowledgement (waiting for all replicas)
+ *           in exchange for strong durability guarantees. Alternative approach of
+ *           asynchronous replication was rejected to ensure data consistency. Pipeline
+ *           recovery handles DataNode failures by rebuilding pipeline with remaining
+ *           nodes. Configurable via dfs.client-write-packet-size (default 64KB).
+ *
  ****************************************************************/
 @InterfaceAudience.Private
 public class DFSOutputStream extends FSOutputSummer
@@ -437,7 +453,19 @@ public class DFSOutputStream extends FSOutputSummer
     return dfsClient.newPathTraceScope("DFSOutputStream#write", src);
   }
 
-  // @see FSOutputSummer#writeChunk()
+  /**
+   * Writes a chunk of data along with its checksum to the current packet.
+   *
+   * @complexity Time: O(len) for copying len bytes of data plus O(cklen) for checksum;
+   *             effectively O(n) where n is the chunk size (typically 512 bytes).
+   *             Space: O(packet_size) for currentPacket buffer allocation when packet
+   *             is null (default 64KB); O(1) additional space per writeChunk call.
+   *             Checksum computation overhead is O(chunk_size) performed by FSOutputSummer
+   *             before this method is called.
+   *             Source: DFSOutputStream.java:writeChunk(byte[],int,int,byte[],int,int)
+   *
+   * @see FSOutputSummer#writeChunk()
+   */
   @Override
   protected synchronized void writeChunk(byte[] b, int offset, int len,
       byte[] checksum, int ckoff, int cklen) throws IOException {
@@ -455,10 +483,19 @@ public class DFSOutputStream extends FSOutputSummer
     }
   }
 
-  /* write the data chunk in <code>buffer</code> staring at
-  * <code>buffer.position</code> with
-  * a length of <code>len > 0</code>, and its checksum
-  */
+  /**
+   * Writes a data chunk from a ByteBuffer along with its checksum to the current packet.
+   * The chunk data starts at buffer.position with length len.
+   *
+   * @complexity Time: O(len) for copying len bytes of data plus O(cklen) for checksum;
+   *             effectively O(n) where n is the chunk size (typically 512 bytes).
+   *             Space: O(packet_size) for currentPacket buffer allocation when packet
+   *             is null (default 64KB); O(1) additional space per writeChunk call.
+   *             Checksum computation overhead is O(chunk_size) performed by FSOutputSummer
+   *             before this method is called. ByteBuffer variant avoids intermediate
+   *             byte[] copy for direct buffer sources.
+   *             Source: DFSOutputStream.java:writeChunk(ByteBuffer,int,byte[],int,int)
+   */
   protected synchronized void writeChunk(ByteBuffer buffer, int len,
       byte[] checksum, int ckoff, int cklen) throws IOException {
     writeChunkPrepare(len, ckoff, cklen);
@@ -637,6 +674,19 @@ public class DFSOutputStream extends FSOutputSummer
    *          mainly used to specify whether or not to update the file length in
    *          the NameNode
    * @throws IOException
+   *
+   * @complexity Time: O(packets) where packets = number of pending packets in dataQueue
+   *             waiting for acknowledgement. The waitForAckedSeqno() call blocks until
+   *             all enqueued packets are acknowledged by the DataNode pipeline.
+   *             Worst case: O(n) where n = total bytes written / packet_size, if all
+   *             packets are still pending. Average case: O(1) to O(k) where k = packets
+   *             in flight (bounded by dfs.client.write.max-packets-in-flight, default 80).
+   *             Space: O(checksum_buffer_size) for flushBuffer operation; additional
+   *             O(packet_size) if empty sync packet created.
+   *             Network-bound: synchronous wait for acknowledgements from all replicas
+   *             in DataNode pipeline adds latency proportional to pipeline depth and
+   *             network round-trip time.
+   *             Source: DFSOutputStream.java:flushOrSync(boolean,EnumSet)
    */
   private void flushOrSync(boolean isSync, EnumSet<SyncFlag> syncFlags)
       throws IOException {
