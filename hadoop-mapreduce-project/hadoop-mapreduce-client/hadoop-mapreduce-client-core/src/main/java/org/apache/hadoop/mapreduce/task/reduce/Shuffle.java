@@ -34,6 +34,22 @@ import org.apache.hadoop.mapreduce.MRJobConfig;
 import org.apache.hadoop.mapreduce.TaskAttemptID;
 import org.apache.hadoop.util.Progress;
 
+/**
+ * Shuffle phase implementation for MapReduce reduce tasks.
+ * 
+ * <p>This class coordinates the shuffling of map output data to reduce tasks,
+ * managing parallel fetchers, event polling, and the final merge operation.</p>
+ * 
+ * @performance Shuffle phase is typically network-bound in distributed deployments.
+ *              Total time = max(network_transfer_time, merge_time). Parallelism
+ *              controlled by MRJobConfig.SHUFFLE_PARALLEL_COPIES (default 5).
+ *              Memory pressure managed by MergeManagerImpl thresholds configured via
+ *              mapreduce.reduce.shuffle.input.buffer.percent (default 70% of heap).
+ *              Local mode uses single LocalFetcher thread, bypassing network overhead.
+ *
+ * @param <K> the key type for map output
+ * @param <V> the value type for map output
+ */
 @InterfaceAudience.LimitedPrivate({"MapReduce"})
 @InterfaceStability.Unstable
 @SuppressWarnings({"unchecked", "rawtypes"})
@@ -93,6 +109,43 @@ public class Shuffle<K, V> implements ShuffleConsumerPlugin<K, V>,
         context.getMapOutputFile());
   }
 
+  /**
+   * Executes the shuffle phase, coordinating map output fetching and merging.
+   * 
+   * <p>This method spawns EventFetcher and Fetcher threads to retrieve map outputs
+   * from completed map tasks, waits for all outputs to be fetched, and performs
+   * the final merge to produce a sorted iterator for the reduce phase.</p>
+   * 
+   * @complexity Time: O(m * n/m) = O(n) where n=total records across all mappers,
+   *             m=number of mappers; each mapper contributes n/m records on average.
+   *             EventFetcher polls completion events from TaskUmbilicalProtocol,
+   *             Fetcher threads retrieve map outputs in parallel (controlled by
+   *             SHUFFLE_PARALLEL_COPIES, default 5). Final merge adds O(n log k)
+   *             where k=number of map outputs being merged.
+   *             Space: O(buffer_size) configurable via mapreduce.reduce.shuffle.
+   *             input.buffer.percent (default 70% of heap); memory is managed by
+   *             MergeManagerImpl with configurable spill thresholds.
+   * 
+   * @performance Scales linearly with input data; network-bound for large datasets.
+   *              Local mode (localMapFiles != null) uses single LocalFetcher thread,
+   *              bypassing network transfer. Remote mode spawns numFetchers parallel
+   *              fetch threads. Progress reported every PROGRESS_FREQUENCY (2000ms).
+   *              Final merge complexity determined by MergeManagerImpl based on
+   *              memory availability and spill configuration.
+   * 
+   * @implNote Thread architecture: 1 EventFetcher thread polls TaskUmbilicalProtocol
+   *           for map completion events (up to maxEventsToFetch per RPC, scaled by
+   *           number of reducers to prevent OOM). numFetchers Fetcher threads
+   *           (default 5, configurable via MRJobConfig.SHUFFLE_PARALLEL_COPIES)
+   *           retrieve map outputs in parallel. Exceptions from any thread are
+   *           captured and surfaced via reportException(). Shutdown sequence:
+   *           eventFetcher.shutDown() -&gt; fetchers[].shutDown() -&gt; scheduler.close()
+   *           -&gt; merger.close() returns final RawKeyValueIterator for reduce phase.
+   * 
+   * @return RawKeyValueIterator providing sorted, merged key-value pairs for reduce
+   * @throws IOException if shuffle or merge operations fail
+   * @throws InterruptedException if the shuffle is interrupted
+   */
   @Override
   public RawKeyValueIterator run() throws IOException, InterruptedException {
     // Scale the maximum events we fetch per RPC call to mitigate OOM issues
@@ -127,8 +180,13 @@ public class Shuffle<K, V> implements ShuffleConsumerPlugin<K, V>,
       }
     }
     
+    // @PerformanceCritical: Main shuffle loop - fetches all map outputs (>10% reduce task time).
+    // Polls scheduler every PROGRESS_FREQUENCY ms (2000ms) until all mappers complete.
+    // Network I/O dominates in distributed mode; local mode bypasses this via LocalFetcher.
     // Wait for shuffle to complete successfully
     while (!scheduler.waitUntilDone(PROGRESS_FREQUENCY)) {
+      // Complexity: O(1) per poll; total iterations = O(shuffle_time / PROGRESS_FREQUENCY)
+      // Merge operations triggered asynchronously by MergeManagerImpl based on memory thresholds
       reporter.progress();
       
       synchronized (this) {
