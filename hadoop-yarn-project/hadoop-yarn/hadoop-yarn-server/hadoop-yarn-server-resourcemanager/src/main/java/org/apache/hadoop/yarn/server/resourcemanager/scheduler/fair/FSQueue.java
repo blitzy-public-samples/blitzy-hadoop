@@ -48,6 +48,23 @@ import org.apache.hadoop.yarn.util.resource.Resources;
 
 import org.apache.hadoop.classification.VisibleForTesting;
 
+/**
+ * Abstract base class for Fair Scheduler queue implementations.
+ * Provides common functionality for resource management, fair share computation,
+ * and queue hierarchy traversal.
+ *
+ * @performance Base queue abstraction with O(1) cached fair share and resource usage access.
+ *              Resource usage updates propagate O(d) through parent hierarchy where d=queue depth.
+ *              Scheduling policy configurable per queue via policy field.
+ *
+ * @implNote Fair share values (fairShare, steadyFairShare) are precomputed and cached for O(1) access.
+ *           Trade-off: Precompute vs on-demand - precomputation occurs at update cycle intervals
+ *           (not per allocation) to amortize O(q × d) computation cost where q=number of queues
+ *           and d=hierarchy depth. Cached values may be slightly stale between update cycles but
+ *           avoids expensive recomputation on every access. Resource usage is maintained
+ *           incrementally via incUsedResource/decUsedResource propagating to parent queues.
+ *           Source: FSQueue.java:57-60
+ */
 @Private
 @Unstable
 public abstract class FSQueue implements Queue, Schedulable {
@@ -107,6 +124,11 @@ public abstract class FSQueue implements Queue, Schedulable {
    * handled by method {@link #verifyAndSetPolicyFromConf}.
    *
    * @param recursive whether child queues should be reinitialized recursively
+   * @complexity Time: O(1) when recursive=false; O(c × d) when recursive=true,
+   *             where c=total child queues in subtree, d=hierarchy depth for
+   *             deepest child. Each queue reinit performs O(1) property initialization.
+   *             Space: O(d) for recursive call stack when recursive=true; O(1) otherwise.
+   *             Source: FSQueue.java:111-121
    */
   public final void reinit(boolean recursive) {
     AllocationConfiguration allocConf = scheduler.getAllocationConfiguration();
@@ -323,11 +345,26 @@ public abstract class FSQueue implements Queue, Schedulable {
     return metrics;
   }
 
-  /** Get the fair share assigned to this Schedulable. */
+  /**
+   * Get the fair share assigned to this Schedulable.
+   *
+   * @return the fair share assigned to this Schedulable.
+   * @complexity Time: O(1) for precomputed cached value access.
+   *             Space: O(1).
+   *             Source: FSQueue.java:327-329
+   */
   public Resource getFairShare() {
     return fairShare;
   }
 
+  /**
+   * Assign a fair share to this Schedulable.
+   *
+   * @param fairShare the fair share to assign.
+   * @complexity Time: O(1) for value assignment and metrics update.
+   *             Space: O(1).
+   *             Source: FSQueue.java:332-336
+   */
   @Override
   public void setFairShare(Resource fairShare) {
     this.fairShare = fairShare;
@@ -337,7 +374,11 @@ public abstract class FSQueue implements Queue, Schedulable {
 
   /**
    * Get the steady fair share assigned to this Schedulable.
+   *
    * @return the steady fair share assigned to this Schedulable.
+   * @complexity Time: O(1) for precomputed cached value access.
+   *             Space: O(1).
+   *             Source: FSQueue.java:342-344
    */
   public Resource getSteadyFairShare() {
     return steadyFairShare;
@@ -348,6 +389,18 @@ public abstract class FSQueue implements Queue, Schedulable {
     metrics.setSteadyFairShare(steadyFairShare);
   }
 
+  /**
+   * Check if the user has access to this queue with the specified ACL.
+   *
+   * @param acl the queue ACL to check.
+   * @param user the user to check access for.
+   * @return true if user has access, false otherwise.
+   * @complexity Time: O(a) where a=number of ACL entries for authorization check.
+   *             The YarnAuthorizationProvider iterates through configured ACL rules
+   *             to determine access permission.
+   *             Space: O(1) for AccessRequest creation.
+   *             Source: FSQueue.java:351-356
+   */
   public boolean hasAccess(QueueACL acl, UserGroupInformation user) {
     return authorizer.checkPermission(
         new AccessRequest(queueEntity, user,
@@ -399,6 +452,11 @@ public abstract class FSQueue implements Queue, Schedulable {
    * To be called holding the scheduler writelock.
    *
    * @param fairShare queue's fairshare.
+   * @complexity Time: O(subclass) - delegates to updateInternal() which varies by queue type.
+   *             FSLeafQueue: O(a log a) where a=applications for sorting and fair share distribution.
+   *             FSParentQueue: O(c × d × a) where c=child queues, d=hierarchy depth, a=apps per leaf.
+   *             Space: O(1) for setFairShare; O(subclass) for updateInternal.
+   *             Source: FSQueue.java:403-406
    */
   public void update(Resource fairShare) {
     setFairShare(fairShare);
@@ -462,9 +520,15 @@ public abstract class FSQueue implements Queue, Schedulable {
   public abstract int getNumRunnableApps();
   
   /**
-   * Helper method to check if the queue should attempt assigning resources
-   * 
-   * @return true if check passes (can assign) or false otherwise
+   * Helper method to check if the queue should attempt assigning resources.
+   *
+   * @param node the scheduler node to check.
+   * @return true if check passes (can assign) or false otherwise.
+   * @complexity Time: O(r) where r=number of resource types for Resource comparison
+   *             via Resources.fitsIn(). Checks reserved container (O(1)) and compares
+   *             resource usage against max share dimension-by-dimension.
+   *             Space: O(1) - no additional allocations.
+   *             Source: FSQueue.java:469-495
    */
   boolean assignContainerPreCheck(FSSchedulerNode node) {
     if (node.getReservedContainer() != null) {
@@ -527,6 +591,16 @@ public abstract class FSQueue implements Queue, Schedulable {
   public void decReservedResource(String nodeLabel, Resource resourceToDec) {
   }
 
+  /**
+   * Get the aggregate amount of resources consumed by this schedulable.
+   *
+   * @return aggregate amount of resources used.
+   * @complexity Time: O(1) for cached usage access.
+   *             Space: O(1).
+   *             Note: Resource usage is maintained incrementally via incUsedResource/decUsedResource
+   *             rather than computed on-demand, enabling constant-time access.
+   *             Source: FSQueue.java:531-533
+   */
   @Override
   public Resource getResourceUsage() {
     return resourceUsage;
@@ -535,7 +609,13 @@ public abstract class FSQueue implements Queue, Schedulable {
   /**
    * Increase resource usage for this queue and all parent queues.
    *
-   * @param res the resource to increase
+   * @param res the resource to increase.
+   * @complexity Time: O(d) where d=queue hierarchy depth for parent chain traversal.
+   *             Each level performs O(1) synchronized addTo operation.
+   *             Space: O(1) per call; O(d) total stack depth for parent propagation.
+   *             Note: synchronized block ensures thread-safe resource accounting across
+   *             concurrent container allocation/release operations.
+   *             Source: FSQueue.java:540-547
    */
   public void incUsedResource(Resource res) {
     synchronized (resourceUsage) {
@@ -549,7 +629,13 @@ public abstract class FSQueue implements Queue, Schedulable {
   /**
    * Decrease resource usage for this queue and all parent queues.
    *
-   * @param res the resource to decrease
+   * @param res the resource to decrease.
+   * @complexity Time: O(d) where d=queue hierarchy depth for parent chain traversal.
+   *             Each level performs O(1) synchronized subtractFrom operation.
+   *             Space: O(1) per call; O(d) total stack depth for parent propagation.
+   *             Note: synchronized block ensures thread-safe resource accounting across
+   *             concurrent container allocation/release operations.
+   *             Source: FSQueue.java:554-561
    */
   protected void decUsedResource(Resource res) {
     synchronized (resourceUsage) {
@@ -566,6 +652,18 @@ public abstract class FSQueue implements Queue, Schedulable {
     return null;
   }
 
+  /**
+   * Check if the additional resource fits within this queue's and all parent
+   * queues' max share limits.
+   *
+   * @param additionalResource the additional resource to check.
+   * @return true if the resource fits within all max share constraints.
+   * @complexity Time: O(d × r) where d=hierarchy depth for parent traversal,
+   *             r=number of resource types for Resource comparison.
+   *             Each level performs O(r) resource addition and comparison operations.
+   *             Space: O(d) for recursive call stack traversing parent chain.
+   *             Source: FSQueue.java:569-587
+   */
   boolean fitsInMaxShare(Resource additionalResource) {
     Resource usagePlusAddition =
         Resources.add(getResourceUsage(), additionalResource);
