@@ -139,6 +139,24 @@ import java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock;
  * separators.  So a queue named "queue1" under the root named, would be 
  * referred to as "root.queue1", and a queue named "queue2" under a queue
  * named "parent1" would be referred to as "root.parent1.queue2".
+ *
+ * @performance Scaling characteristics: O(q × a × n) where q=number of queues,
+ *              a=average applications per queue, n=nodes in cluster. Fair share
+ *              recomputation overhead is O(q × d) where d=queue hierarchy depth.
+ *              Scheduling cycle complexity depends on assignMultiple configuration:
+ *              when disabled, assigns one container per heartbeat O(q × a);
+ *              when enabled, may assign multiple containers bounded by
+ *              maxResourcesToAssign (half of node's unallocated resources).
+ *              Source: FairScheduler.java:1129-1188 (attemptScheduling)
+ *
+ * @implNote Fair share scheduling uses weighted fair queuing to distribute
+ *           resources proportionally across queues based on weights and demand.
+ *           Comparison with CapacityScheduler: FairScheduler computes fair shares
+ *           dynamically on each update cycle via recomputeSteadyShares(), whereas
+ *           CapacityScheduler uses static capacity percentages configured at startup.
+ *           Trade-off: Dynamic fair share computation adds O(q × d) overhead per
+ *           update cycle (default 500ms interval) but provides more responsive
+ *           resource distribution that adapts to changing cluster demand patterns.
  */
 @LimitedPrivate("yarn")
 @Unstable
@@ -721,6 +739,12 @@ public class FairScheduler extends
 
   /**
    * Clean up a completed container.
+   *
+   * @complexity Time: O(1) for container lookup via ConcurrentHashMap and removal
+   *             from node's container list; O(q) if updateRootQueueMetrics() triggers
+   *             queue aggregation where q=number of queues in the hierarchy.
+   *             Space: O(1) - no additional allocations beyond local references.
+   *             Source: FairScheduler.java:726-773
    */
   @Override
   protected void completedContainerInternal(
@@ -772,6 +796,16 @@ public class FairScheduler extends
     }
   }
 
+  /**
+   * Add a new node to the scheduler and recompute fair shares.
+   *
+   * @complexity Time: O(q × d) for recomputeSteadyShares() traversing the queue
+   *             hierarchy where q=number of queues and d=maximum queue depth.
+   *             Additional O(c) for recoverContainersOnNode where c=containers
+   *             on the node being added. Total: O(q × d + c).
+   *             Space: O(c) for container recovery state where c=containers on node.
+   *             Source: FairScheduler.java:775-796
+   */
   private void addNode(List<NMContainerStatus> containerReports,
       RMNode node) {
     writeLock.lock();
@@ -795,6 +829,16 @@ public class FairScheduler extends
     }
   }
 
+  /**
+   * Remove a node from the scheduler and clean up associated containers.
+   *
+   * @complexity Time: O(c + q × d) where c=running containers on the node being
+   *             removed (each container requires completedContainer() call with O(1)
+   *             lookup and cleanup), and q × d for recomputeSteadyShares() traversing
+   *             the queue hierarchy where q=number of queues and d=maximum queue depth.
+   *             Space: O(c) for container list iteration and cleanup state.
+   *             Source: FairScheduler.java:798-838
+   */
   private void removeNode(RMNode rmNode) {
     writeLock.lock();
     try {
@@ -1075,7 +1119,18 @@ public class FairScheduler extends
     fsOpDurations.addContinuousSchedulingRunDuration(duration);
   }
 
-  /** Sort nodes by available resource */
+  /**
+   * Sort nodes by available resource.
+   *
+   * @implNote Comparator used for sorting nodes by available resources in descending
+   *           order (nodes with most available capacity first). This enables greedy
+   *           scheduling strategy where containers are preferentially placed on nodes
+   *           with the most available resources, maximizing the chance of successful
+   *           allocation and reducing fragmentation. The comparison uses
+   *           RESOURCE_CALCULATOR which performs O(r) comparison where r=number of
+   *           resource types (typically memory and vcores, so effectively O(1)).
+   *           Source: FairScheduler.java:1079-1088
+   */
   private class NodeAvailableResourceComparator
       implements Comparator<FSSchedulerNode> {
 
@@ -1087,6 +1142,16 @@ public class FairScheduler extends
     }
   }
 
+  /**
+   * Determine whether to continue assigning containers in the current scheduling cycle.
+   *
+   * @complexity Time: O(r) where r=number of resource types for Resources.fitsIn()
+   *             comparison when maxAssignDynamic is enabled. With typical resource
+   *             types (memory and vcores), this is effectively O(1). When
+   *             maxAssignDynamic is disabled, comparison is O(1) integer check.
+   *             Space: O(1) - no allocations, pure comparison operations.
+   *             Source: FairScheduler.java:1090-1104
+   */
   private boolean shouldContinueAssigning(int containers,
       Resource maxResourcesToAssign, Resource assignedResource) {
     if (!assignMultiple) {
@@ -1106,6 +1171,16 @@ public class FairScheduler extends
   /**
    * Assign preempted containers to the applications that have reserved
    * resources for preempted containers.
+   *
+   * @complexity Time: O(p × c) where p=number of entries in the node's preemption
+   *             list (applications waiting for preempted resources) and c=average
+   *             containers to assign per entry. Each assignContainer() call involves
+   *             O(1) resource matching. Worst case iterates until preemptionPending
+   *             resources are exhausted or assignment fails.
+   *             Space: O(1) for iteration state; Resources.clone() creates one
+   *             Resource object per preemption entry.
+   *             Source: FairScheduler.java:1111-1126
+   *
    * @param node Node to check
    */
   static void assignPreemptedContainers(FSSchedulerNode node) {
@@ -1125,6 +1200,21 @@ public class FairScheduler extends
     }
   }
 
+  /**
+   * Attempt to schedule containers on the given node.
+   *
+   * @complexity Time: O(q × a) worst-case where q=number of queues and a=average
+   *             applications per queue, for full queue tree traversal during
+   *             assignContainer(). The method executes in three phases:
+   *             (1) Preempted containers assignment: O(p) where p=preemption list size
+   *             (2) Reserved container check: O(1) for single reservation lookup
+   *             (3) Queue assignment loop: O(q × a) per iteration, with iterations
+   *                 bounded by assignMultiple configuration (single container when
+   *                 disabled, up to maxResourcesToAssign/2 when enabled).
+   *             Space: O(1) for scheduling state; O(d) stack depth for recursive
+   *             queue traversal where d=queue hierarchy depth.
+   *             Source: FairScheduler.java:1203-1263
+   */
   @VisibleForTesting
   void attemptScheduling(FSSchedulerNode node) {
     writeLock.lock();
@@ -1165,6 +1255,10 @@ public class FairScheduler extends
         Resource maxResourcesToAssign = Resources.multiply(
             node.getUnallocatedResource(), 0.5f);
 
+        // @PerformanceCritical: Main scheduling loop - iterates through queue hierarchy
+        // calling assignContainer() which traverses all queues and applications to find
+        // the best candidate for container allocation (>10% of scheduling cycle time).
+        // This is the hot path for container allocation in FairScheduler.
         while (node.getReservedContainer() == null) {
           Resource assignment = queueMgr.getRootQueue().assignContainer(node);
 
