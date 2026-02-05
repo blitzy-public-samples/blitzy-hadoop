@@ -809,7 +809,8 @@ public class ComplexityAnnotationCounter {
         }
         
         try (BufferedWriter writer = new BufferedWriter(
-                new FileWriter(REPORT_OUTPUT_PATH, StandardCharsets.UTF_8))) {
+                new java.io.OutputStreamWriter(
+                    new java.io.FileOutputStream(REPORT_OUTPUT_PATH), StandardCharsets.UTF_8))) {
             
             int totalMethods = detectedMethods.size();
             int annotatedCount = (int) detectedMethods.stream()
