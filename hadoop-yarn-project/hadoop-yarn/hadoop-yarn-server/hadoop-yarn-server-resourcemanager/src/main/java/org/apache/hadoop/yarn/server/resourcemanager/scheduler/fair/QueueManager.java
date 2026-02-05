@@ -43,6 +43,21 @@ import java.util.concurrent.CopyOnWriteArrayList;
 /**
  * Maintains a list of queues as well as scheduling parameters for each queue,
  * such as guaranteed share allocations, from the fair scheduler config file.
+ *
+ * @performance Memory footprint: O(q) where q=total queues stored in HashMap.
+ *              Queue lookup by name is O(1) amortized via HashMap.get().
+ *              Queue enumeration via getQueues() is O(q) for immutable copy creation.
+ *              Queue creation triggers O(d) parent traversal where d=queue hierarchy depth,
+ *              followed by O(q × d) recomputeSteadyShares traversal of entire queue tree.
+ *              Source: QueueManager.java
+ *
+ * @implNote HashMap&lt;String, FSQueue&gt; provides O(1) amortized lookup for queue access
+ *           by fully-qualified name. CopyOnWriteArrayList&lt;FSLeafQueue&gt; enables thread-safe
+ *           iteration over leaf queues without explicit locking during reads.
+ *           synchronized(queues) block ensures thread-safe queue creation and modification.
+ *           Trade-off: HashMap for O(1) lookup vs TreeMap O(log q) sorted access -
+ *           lookup performance prioritized since queue access by name is more frequent
+ *           than sorted enumeration in scheduling operations.
  */
 @Private
 @Unstable
@@ -126,6 +141,13 @@ public class QueueManager {
    * @param create <code>true</code> if the queue must be created if it does
    *               not exist, <code>false</code> otherwise
    * @return the leaf queue or <code>null</code> if the queue cannot be found
+   *
+   * @complexity Time: O(1) for lookup when queue exists via HashMap.get();
+   *             O(d) for creation path where d=queue hierarchy depth for
+   *             buildNewQueueList parent traversal. If creation triggers
+   *             recomputeSteadyShares, additional O(q × d) where q=total queues.
+   *             Space: O(1) for lookup; O(d) during creation for newQueueNames list.
+   *             Source: QueueManager.java:130-132
    */
   public FSLeafQueue getLeafQueue(String name, boolean create) {
     return getLeafQueue(name, create, null, true);
@@ -145,12 +167,26 @@ public class QueueManager {
    *               not exist, <code>false</code> otherwise
    * @param applicationId the application ID to assign to the queue
    * @return the leaf queue or <code>null</code> if teh queue cannot be found
+   *
+   * @complexity Time: O(1) for lookup when queue exists via HashMap.get();
+   *             O(d) for creation path where d=queue hierarchy depth.
+   *             If creation triggers recomputeSteadyShares, additional O(q × d).
+   *             Space: O(1) for lookup; O(d) during creation.
+   *             Source: QueueManager.java:149-152
    */
   public FSLeafQueue getLeafQueue(String name, boolean create,
                                   ApplicationId applicationId) {
     return getLeafQueue(name, create, applicationId, true);
   }
 
+  /**
+   * Internal method to get or create a leaf queue.
+   *
+   * @complexity Time: O(1) for lookup when queue exists; O(d) for creation
+   *             where d=queue hierarchy depth. Space: O(1) for lookup; O(d)
+   *             during creation for queue list construction.
+   *             Source: QueueManager.java:154-163
+   */
   private FSLeafQueue getLeafQueue(String name, boolean create,
                                    ApplicationId applicationId,
                                    boolean recomputeSteadyShares) {
@@ -189,6 +225,13 @@ public class QueueManager {
    * @param create <code>true</code> if the queue must be created if it does
    *               not exist, <code>false</code> otherwise
    * @return the parent queue or <code>null</code> if the queue cannot be found
+   *
+   * @complexity Time: O(1) for lookup when queue exists via HashMap.get();
+   *             O(d) for creation path where d=queue hierarchy depth for
+   *             buildNewQueueList parent traversal. If creation triggers
+   *             recomputeSteadyShares, additional O(q × d) where q=total queues.
+   *             Space: O(1) for lookup; O(d) during creation for newQueueNames list.
+   *             Source: QueueManager.java:193-195
    */
   public FSParentQueue getParentQueue(String name, boolean create) {
     return getParentQueue(name, create, true);
@@ -212,6 +255,12 @@ public class QueueManager {
    *                              should be recalculated when a queue is added,
    *                              <code>false</code> otherwise
    * @return the parent queue or <code>null</code> if the queue cannot be found
+   *
+   * @complexity Time: O(1) for lookup when queue exists; O(d) for creation
+   *             where d=queue hierarchy depth. When recomputeSteadyShares=true
+   *             and queue is created, additional O(q × d) for tree traversal.
+   *             Space: O(1) for lookup; O(d) during creation.
+   *             Source: QueueManager.java:216-224
    */
   public FSParentQueue getParentQueue(String name, boolean create,
       boolean recomputeSteadyShares) {
@@ -223,6 +272,17 @@ public class QueueManager {
     return (FSParentQueue) queue;
   }
 
+  /**
+   * Core method for retrieving or creating queues of any type.
+   *
+   * @complexity Time: O(1) for lookup via HashMap.get() when queue exists;
+   *             O(d × q) if creation triggers buildNewQueueList traversal
+   *             (O(d) for parent chain) and recomputeSteadyShares (O(q × d)
+   *             tree traversal) where d=depth, q=total queues.
+   *             Space: O(d) for new queue list during creation path;
+   *             O(1) for lookup-only path.
+   *             Source: QueueManager.java:226-250
+   */
   private FSQueue getQueue(String name, boolean create, FSQueueType queueType,
       boolean recomputeSteadyShares, ApplicationId applicationId) {
     boolean recompute = recomputeSteadyShares;
@@ -256,6 +316,12 @@ public class QueueManager {
    * 
    * @return the created queue, if successful or null if not allowed (one of the
    * parent queues in the queue name is already a leaf queue)
+   *
+   * @complexity Time: O(d) where d=depth of queue path for buildNewQueueList
+   *             parent traversal, plus O(d) for createNewQueues iteration
+   *             over new queue names. Total O(d) since both traverse d elements.
+   *             Space: O(d) for newQueueNames ArrayList holding queue path segments.
+   *             Source: QueueManager.java:261-273
    */
   @VisibleForTesting
   FSQueue createQueue(String name, FSQueueType queueType) {
@@ -283,6 +349,12 @@ public class QueueManager {
    * @param name the fully qualified name of the queue to create
    * @param newQueueNames the list to which to add non-existent queues
    * @return the deepest existing parent queue
+   *
+   * @complexity Time: O(d) where d=queue path depth for while loop traversing
+   *             parent chain via lastIndexOf('.') and HashMap.get() lookups.
+   *             Each iteration performs O(1) string operations and O(1) map lookup.
+   *             Space: O(d) for accumulated queue names added to newQueueNames list.
+   *             Source: QueueManager.java:287-321
    */
   private FSParentQueue buildNewQueueList(String name,
       List<String> newQueueNames) {
@@ -545,6 +617,13 @@ public class QueueManager {
    * Gets a queue by name.
    * @param name queue name.
    * @return queue objects, FSQueue.
+   *
+   * @complexity Time: O(1) for HashMap lookup via queues.get(name).
+   *             ensureRootPrefix performs O(k) string operations where k=name length,
+   *             but k is typically small (bounded by queue naming conventions).
+   *             Space: O(1) - returns existing reference, no new allocations
+   *             except potential String concatenation in ensureRootPrefix.
+   *             Source: QueueManager.java:549-554
    */
   public FSQueue getQueue(String name) {
     name = ensureRootPrefix(name);
@@ -559,6 +638,12 @@ public class QueueManager {
    * @param name queue name.
    * @return Returns true if the queue exists,
    * otherwise returns false.
+   *
+   * @complexity Time: O(1) for HashMap.containsKey lookup after O(k)
+   *             ensureRootPrefix where k=name length (typically small).
+   *             Space: O(1) - boolean return, no allocations except
+   *             potential String in ensureRootPrefix.
+   *             Source: QueueManager.java:563-568
    */
   public boolean exists(String name) {
     name = ensureRootPrefix(name);
@@ -570,6 +655,13 @@ public class QueueManager {
   /**
    * Get a collection of all leaf queues.
    * @return a collection of all leaf queues.
+   *
+   * @complexity Time: O(1) for returning CopyOnWriteArrayList reference.
+   *             Note: CopyOnWriteArrayList provides thread-safe iteration
+   *             without copying on read operations.
+   *             Space: O(1) for reference return - no copy made, returns
+   *             the underlying CopyOnWriteArrayList directly.
+   *             Source: QueueManager.java:574-578
    */
   public Collection<FSLeafQueue> getLeafQueues() {
     synchronized (queues) {
@@ -580,6 +672,12 @@ public class QueueManager {
   /**
    * Get a collection of all queues.
    * @return a collection of all queues.
+   *
+   * @complexity Time: O(q) where q=total queues for ImmutableList.copyOf()
+   *             which iterates over all HashMap values to create immutable copy.
+   *             Space: O(q) for returned immutable copy containing references
+   *             to all FSQueue objects in the queues HashMap.
+   *             Source: QueueManager.java:584-588
    */
   public Collection<FSQueue> getQueues() {
     synchronized (queues) {
@@ -594,6 +692,17 @@ public class QueueManager {
     return name;
   }
   
+  /**
+   * Updates queue allocation configuration from the provided AllocationConfiguration.
+   * Creates leaf queues and parent queues as needed, then reinitializes the queue tree.
+   *
+   * @complexity Time: O(q × d) where q=configured queues in queueConf, d=average depth.
+   *             For each configured queue: O(d) for creation/verification path.
+   *             Final reinit traverses all queues: O(q × d) for recursive reinitialization.
+   *             recomputeSteadyShares: O(q × d) for tree traversal computing fair shares.
+   *             Space: O(q) for queue storage in HashMap and leaf queue list.
+   *             Source: QueueManager.java:597-621
+   */
   public void updateAllocationConfiguration(AllocationConfiguration queueConf) {
     // Create leaf queues and the parent queues in a leaf's
     // ancestry if they do not exist
