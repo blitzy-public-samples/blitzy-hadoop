@@ -56,6 +56,35 @@ import org.slf4j.LoggerFactory;
 import org.apache.hadoop.classification.VisibleForTesting;
 import org.apache.hadoop.thirdparty.com.google.common.base.Splitter;
 
+/**
+ * Metrics tracking for YARN scheduler queues providing real-time visibility
+ * into resource allocation, application states, and container management.
+ *
+ * <p>This class maintains per-queue metrics including allocated/pending/reserved
+ * resources, application counts, and container allocation statistics. Metrics
+ * are propagated hierarchically from child queues to parent queues.
+ *
+ * @performance Linear scaling with number of concurrent applications and queues.
+ *              Metrics2 library provides thread-safe atomic operations via
+ *              MutableGauge/MutableCounter classes ensuring O(1) individual updates.
+ *              Aggregation overhead during getMetrics collection: O(q) where
+ *              q=number of queues in hierarchy. Memory footprint scales linearly
+ *              with number of users when user metrics are enabled.
+ *              Source: QueueMetrics.java:188-208 (constructor), QueueMetrics.java:448-451 (getMetrics)
+ *
+ * @implNote Uses MutableGauge/MutableCounter from Hadoop metrics2 library for
+ *           thread-safe O(1) atomic counter and gauge operations without explicit
+ *           synchronization. Parent metrics aggregation strategy propagates all
+ *           metric updates through the queue hierarchy by recursively calling
+ *           parent.methodName() - this ensures consistent aggregated views at
+ *           each queue level but introduces O(d) overhead where d=queue depth.
+ *           ConcurrentHashMap used for QUEUE_METRICS cache (line 256-257) to
+ *           enable lock-free concurrent access during queue registration while
+ *           maintaining thread-safety. User metrics map uses HashMap protected
+ *           by method-level synchronization since user creation is less frequent
+ *           than metric updates.
+ *           Source: QueueMetrics.java:256-257 (QUEUE_METRICS), QueueMetrics.java:200 (users map)
+ */
 @InterfaceAudience.Private
 @Metrics(context="yarn")
 public class QueueMetrics implements MetricsSource {
@@ -236,6 +265,21 @@ public class QueueMetrics implements MetricsSource {
     return sb;
   }
 
+  /**
+   * Factory method to get or create QueueMetrics for a named queue.
+   * Delegates to the overloaded method with the default MetricsSystem.
+   *
+   * @param queueName the name of the queue
+   * @param parent the parent queue (may be null for root queue)
+   * @param enableUserMetrics whether to track per-user metrics
+   * @param conf the configuration
+   * @return QueueMetrics instance for the specified queue
+   *
+   * @complexity Time: O(1) for cache hit; O(q) for cache miss where q=queue hierarchy
+   *             depth due to parent queue traversal during construction and metric
+   *             registration. Space: O(1) - returns cached or newly created reference.
+   *             Source: QueueMetrics.java:268-285 (delegated forQueue implementation)
+   */
   public synchronized static QueueMetrics forQueue(String queueName,
       Queue parent, boolean enableUserMetrics, Configuration conf) {
     return forQueue(DefaultMetricsSystem.instance(), queueName, parent,
@@ -265,6 +309,31 @@ public class QueueMetrics implements MetricsSource {
     return QUEUE_METRICS;
   }
 
+  /**
+   * Factory method to get or create QueueMetrics for a named queue with
+   * a specified MetricsSystem. Uses a ConcurrentHashMap cache (QUEUE_METRICS)
+   * for efficient lookup and to prevent duplicate registrations.
+   *
+   * @param ms the MetricsSystem to register metrics with
+   * @param queueName the name of the queue
+   * @param parent the parent queue (may be null for root queue)
+   * @param enableUserMetrics whether to track per-user metrics
+   * @param conf the configuration
+   * @return QueueMetrics instance for the specified queue
+   *
+   * @complexity Time: O(1) average for cache lookup in ConcurrentHashMap;
+   *             O(q) worst-case for cache miss where q=queue hierarchy depth
+   *             due to parent traversal in constructor (line 198) and queue name
+   *             parsing in sourceName() which iterates through hierarchical queue
+   *             path components. Space: O(1) for cache hit; O(m) for cache miss
+   *             where m=number of metric fields initialized in new QueueMetrics.
+   *             Source: QueueMetrics.java:268-285
+   *
+   * @implNote Cache lookup uses ConcurrentHashMap.get() which is lock-free for
+   *           reads. Synchronized method prevents race conditions during cache
+   *           miss handling where new QueueMetrics creation and registration
+   *           must be atomic to avoid duplicate metrics registrations.
+   */
   public synchronized static QueueMetrics forQueue(MetricsSystem ms,
       String queueName, Queue parent, boolean enableUserMetrics,
       Configuration conf) {
@@ -284,6 +353,23 @@ public class QueueMetrics implements MetricsSource {
     return metrics;
   }
 
+  /**
+   * Gets or creates user-specific QueueMetrics for tracking per-user resource usage.
+   * User metrics are lazily created on first access if user metrics are enabled.
+   *
+   * @param userName the name of the user
+   * @return QueueMetrics for the user, or null if user metrics are disabled
+   *
+   * @complexity Time: O(1) average for HashMap lookup; O(m) for cache miss where
+   *             m=number of metric fields initialized in new QueueMetrics.
+   *             Space: O(1) for existing user; O(m) for new user metrics creation.
+   *             Source: QueueMetrics.java:287-302
+   *
+   * @implNote Synchronized method protects HashMap access since user metrics
+   *           creation is less frequent than metric updates. Uses standard HashMap
+   *           (not ConcurrentHashMap) since method-level synchronization provides
+   *           sufficient thread-safety for user registration use case.
+   */
   public synchronized QueueMetrics getUserMetrics(String userName) {
     if (users == null) {
       return null;
@@ -445,12 +531,49 @@ public class QueueMetrics implements MetricsSource {
     }
   }
 
+  /**
+   * Collects all metrics for this queue into the provided MetricsCollector.
+   * Called by the metrics2 framework during periodic metric collection.
+   *
+   * @param collector the MetricsCollector to receive the metrics
+   * @param all if true, include all metrics; if false, include only changed metrics
+   *
+   * @complexity Time: O(b + m) where b=number of time buckets for updateRunningTime()
+   *             and m=number of registered metrics in the registry for snapshot
+   *             iteration. Typical case: O(1) as bucket count and metric count are
+   *             bounded constants (~50 standard metrics per queue).
+   *             Space: O(1) for in-memory retrieval - metrics values already stored.
+   *             Source: QueueMetrics.java:448-451
+   *
+   * @implNote updateRunningTime() iterates through fixed-size runningTime bucket
+   *           array (configured via RM_METRICS_RUNTIME_BUCKETS, default ~5 buckets).
+   *           registry.snapshot() iterates through all registered MutableMetric
+   *           instances but performs constant-time value retrieval for each.
+   */
   public void getMetrics(MetricsCollector collector, boolean all) {
     updateRunningTime();
     registry.snapshot(collector.addRecord(registry.info()), all);
   }
 
+  /**
+   * Records a new application submission to this queue. Increments the
+   * appsSubmitted counter and propagates to user metrics and parent queue.
+   *
+   * @param user the user who submitted the application
+   * @param unmanagedAM true if the application uses an unmanaged ApplicationMaster
+   *
+   * @complexity Time: O(d) where d=queue hierarchy depth due to recursive parent
+   *             propagation (parent.submitApp call). Each level performs O(1)
+   *             atomic counter increment via MutableCounterInt.incr().
+   *             Space: O(d) stack depth for recursive parent calls.
+   *             Source: QueueMetrics.java:453-465
+   *
+   * @implNote Counter increments use MutableCounterInt.incr() which performs
+   *           atomic increment without synchronization overhead. User metrics
+   *           lookup may trigger synchronized getUserMetrics() on first access.
+   */
   public void submitApp(String user, boolean unmanagedAM) {
+    // @PerformanceCritical: Counter increment - O(1) atomic operation
     appsSubmitted.incr();
     if(unmanagedAM) {
       unmanagedAppsSubmitted.incr();
@@ -465,7 +588,25 @@ public class QueueMetrics implements MetricsSource {
   }
 
 
+  /**
+   * Records a new application attempt submission. Increments pending apps
+   * gauge and propagates to user metrics and parent queue hierarchy.
+   *
+   * @param user the user who submitted the application attempt
+   * @param unmanagedAM true if the application uses an unmanaged ApplicationMaster
+   *
+   * @complexity Time: O(d) where d=queue hierarchy depth due to recursive parent
+   *             propagation (parent.submitAppAttempt call). Each level performs
+   *             O(1) atomic gauge increment via MutableGaugeInt.incr().
+   *             Space: O(d) stack depth for recursive parent calls.
+   *             Source: QueueMetrics.java:468-480
+   *
+   * @implNote Gauge increments use MutableGaugeInt.incr() providing thread-safe
+   *           atomic updates. appsPending tracks current pending count (gauge)
+   *           unlike appsSubmitted which is a monotonic counter.
+   */
   public void submitAppAttempt(String user, boolean unmanagedAM) {
+    // @PerformanceCritical: Gauge increment - O(1) atomic operation
     appsPending.incr();
     if(unmanagedAM) {
       unmanagedAppsPending.incr();
@@ -680,18 +821,32 @@ public class QueueMetrics implements MetricsSource {
   }
 
   /**
-   * Increment pending resource metrics
+   * Increment pending resource metrics for a partition and user.
+   * Updates pending containers, memory, vcores, and custom resources.
    *
    * @param partition Node Partition
    * @param user Name of the user.
    * @param containers containers count.
    * @param res the TOTAL delta of resources note this is different from the
    *          other APIs which use per container resource
+   *
+   * @complexity Time: O(d + p) where d=queue hierarchy depth for parent propagation
+   *             via internalIncrPendingResources, and p=partition metrics lookup/creation.
+   *             Each gauge update is O(1) amortized via MutableGaugeLong/MutableGaugeInt.
+   *             Custom resource updates add O(r) where r=number of custom resource types.
+   *             Space: O(1) for existing metrics; O(m) if new partition metrics created
+   *             where m=number of metric fields.
+   *             Source: QueueMetrics.java:691-707
+   *
+   * @implNote Partitioned metrics support enables per-node-label resource tracking.
+   *           Internal method propagates updates through queue hierarchy and user
+   *           metrics. Gauge operations (incr) are atomic and thread-safe.
    */
   public void incrPendingResources(String partition, String user,
       int containers, Resource res) {
 
     if (partition == null || partition.equals(RMNodeLabelsManager.NO_LABEL)) {
+      // @PerformanceCritical: Default partition update path - O(d) hierarchy traversal
       internalIncrPendingResources(partition, user, containers, res);
     }
 
@@ -819,10 +974,32 @@ public class QueueMetrics implements MetricsSource {
     }
   }
 
+  /**
+   * Records resource allocation for containers. Updates allocated counters
+   * and optionally decrements pending resources. Propagates through queue
+   * hierarchy and partition-specific metrics.
+   *
+   * @param partition Node Partition
+   * @param user Name of the user
+   * @param containers number of containers allocated
+   * @param res resource per container (memory, vcores, custom resources)
+   * @param decrPending if true, decrement pending resources by allocated amount
+   *
+   * @complexity Time: O(d + p + r) where d=queue hierarchy depth for parent propagation,
+   *             p=partition metrics operations, r=number of custom resource types.
+   *             Each counter/gauge operation is O(1) atomic via MutableCounter/MutableGauge.
+   *             Space: O(1) for counter operations; no additional allocations.
+   *             Source: QueueMetrics.java:822-838
+   *
+   * @implNote Allocation metrics include both instantaneous gauges (allocatedContainers,
+   *           allocatedMB, allocatedVCores) and cumulative counters (aggregateContainersAllocated).
+   *           Dual update pattern provides both point-in-time and historical views.
+   */
   public void allocateResources(String partition, String user, int containers,
       Resource res, boolean decrPending) {
 
     if (partition == null || partition.equals(RMNodeLabelsManager.NO_LABEL)) {
+      // @PerformanceCritical: Container allocation hot path - O(d) hierarchy updates
       internalAllocateResources(partition, user, containers, res, decrPending);
     }
 
@@ -837,6 +1014,21 @@ public class QueueMetrics implements MetricsSource {
     }
   }
 
+  /**
+   * Internal allocation propagation through queue hierarchy. Updates this queue's
+   * metrics and recursively propagates to user metrics and parent queue.
+   *
+   * @param partition Node Partition
+   * @param user Name of the user
+   * @param containers number of containers allocated
+   * @param res resource per container
+   * @param decrPending if true, decrement pending resources
+   *
+   * @complexity Time: O(d) where d=queue hierarchy depth due to recursive parent
+   *             calls. computeAllocateResources is O(r) where r=custom resource count.
+   *             Space: O(d) stack depth for recursion.
+   *             Source: QueueMetrics.java:840-852
+   */
   public void internalAllocateResources(String partition, String user,
       int containers, Resource res, boolean decrPending) {
     computeAllocateResources(containers, res, decrPending);
@@ -852,14 +1044,26 @@ public class QueueMetrics implements MetricsSource {
   }
 
   /**
-   * Allocate Resources for a partition with support for resource vectors.
+   * Computes and updates allocation metrics for containers with support for
+   * resource vectors including custom resources.
    *
    * @param containers number of containers
    * @param res resource containing memory size, vcores etc
    * @param decrPending decides whether to decrease pending resource or not
+   *
+   * @complexity Time: O(1) for standard resources (memory, vcores) + O(r) where
+   *             r=number of custom resource types if custom resources enabled.
+   *             Each gauge/counter update is O(1) atomic operation.
+   *             Space: O(1) - no allocations, only counter/gauge updates.
+   *             Source: QueueMetrics.java:861-876
+   *
+   * @implNote Updates both instantaneous gauges (allocatedContainers, allocatedMB,
+   *           allocatedVCores) for current state and cumulative counter
+   *           (aggregateContainersAllocated) for total historical count.
    */
   private void computeAllocateResources(int containers, Resource res,
       boolean decrPending) {
+    // @PerformanceCritical: Multiple O(1) atomic counter/gauge operations
     allocatedContainers.incr(containers);
     aggregateContainersAllocated.incr(containers);
     allocatedMB.incr(res.getMemorySize() * containers);
@@ -876,12 +1080,26 @@ public class QueueMetrics implements MetricsSource {
   }
 
   /**
-   * Allocate Resource for container size change.
+   * Allocate Resource for container size change (increase/decrease).
+   * Updates both allocated and pending resource gauges atomically and
+   * propagates to user metrics and parent queue.
+   *
    * @param partition Node Partition
    * @param user Name of the user
-   * @param res Resource.
+   * @param res Resource delta (may be positive for increase, negative for decrease)
+   *
+   * @complexity Time: O(d + r) where d=queue hierarchy depth for recursive parent
+   *             propagation, r=number of custom resource types to update.
+   *             Each gauge operation (incr/decr) is O(1) atomic.
+   *             Space: O(d) stack depth for recursive calls.
+   *             Source: QueueMetrics.java:884-910
+   *
+   * @implNote Used for container resize operations where container count stays same
+   *           but resource allocation changes. Simultaneously updates allocated (increase)
+   *           and pending (decrease) to maintain resource accounting consistency.
    */
   public void allocateResources(String partition, String user, Resource res) {
+    // @PerformanceCritical: Gauge updates - O(1) atomic operations each
     allocatedMB.incr(res.getMemorySize());
     allocatedVCores.incr(res.getVirtualCores());
     if (queueMetricsForCustomResources != null) {
@@ -909,10 +1127,31 @@ public class QueueMetrics implements MetricsSource {
     }
   }
 
+  /**
+   * Records resource release when containers complete or are killed.
+   * Decrements allocated gauges and increments release counters.
+   * Propagates through queue hierarchy and partition-specific metrics.
+   *
+   * @param partition Node Partition
+   * @param user Name of the user
+   * @param containers number of containers released
+   * @param res resource per container being released
+   *
+   * @complexity Time: O(d + p + r) where d=queue hierarchy depth for parent propagation,
+   *             p=partition metrics operations, r=number of custom resource types.
+   *             Each gauge decrement is O(1) atomic via MutableGaugeLong.decr().
+   *             Space: O(1) for counter operations; no additional allocations.
+   *             Source: QueueMetrics.java:912-928
+   *
+   * @implNote Release updates both instantaneous gauges (allocatedContainers decremented)
+   *           and cumulative counters (aggregateContainersReleased incremented) to
+   *           provide both current state and historical release counts.
+   */
   public void releaseResources(String partition, String user, int containers,
       Resource res) {
 
     if (partition == null || partition.equals(RMNodeLabelsManager.NO_LABEL)) {
+      // @PerformanceCritical: Container release path - O(d) hierarchy updates
       internalReleaseResources(partition, user, containers, res);
     }
 
@@ -927,6 +1166,20 @@ public class QueueMetrics implements MetricsSource {
     }
   }
 
+  /**
+   * Internal release propagation through queue hierarchy. Updates this queue's
+   * release metrics and recursively propagates to user metrics and parent queue.
+   *
+   * @param partition Node Partition
+   * @param user Name of the user
+   * @param containers number of containers released
+   * @param res resource per container
+   *
+   * @complexity Time: O(d) where d=queue hierarchy depth due to recursive parent
+   *             calls. computeReleaseResources is O(r) where r=custom resource count.
+   *             Space: O(d) stack depth for recursion.
+   *             Source: QueueMetrics.java:930-941
+   */
   public void internalReleaseResources(String partition, String user,
       int containers, Resource res) {
 
@@ -941,12 +1194,24 @@ public class QueueMetrics implements MetricsSource {
   }
 
   /**
-   * Release Resources for a partition with support for resource vectors.
+   * Computes and updates release metrics for containers with support for
+   * resource vectors including custom resources.
    *
    * @param containers number of containers
    * @param res resource containing memory size, vcores etc
+   *
+   * @complexity Time: O(1) for standard resources (memory, vcores) + O(r) where
+   *             r=number of custom resource types if custom resources enabled.
+   *             Each gauge decrement and counter increment is O(1) atomic.
+   *             Space: O(1) - no allocations, only counter/gauge updates.
+   *             Source: QueueMetrics.java:949-960
+   *
+   * @implNote Decrements instantaneous gauges (allocatedContainers, allocatedMB,
+   *           allocatedVCores) while incrementing cumulative counter
+   *           (aggregateContainersReleased) for historical release tracking.
    */
   private void computeReleaseResources(int containers, Resource res) {
+    // @PerformanceCritical: Multiple O(1) atomic gauge/counter operations
     allocatedContainers.decr(containers);
     aggregateContainersReleased.incr(containers);
     allocatedMB.decr(res.getMemorySize() * containers);
