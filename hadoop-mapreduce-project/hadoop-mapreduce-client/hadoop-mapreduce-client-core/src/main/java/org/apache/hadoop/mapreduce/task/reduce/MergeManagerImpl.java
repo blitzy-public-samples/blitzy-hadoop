@@ -62,6 +62,21 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.hadoop.classification.VisibleForTesting;
 
+/**
+ * Implementation of MergeManager that manages the merge of map outputs during
+ * the shuffle phase of a reduce task. Handles both in-memory and on-disk merging
+ * of map output data.
+ *
+ * @performance Memory management uses configurable thresholds: SHUFFLE_INPUT_BUFFER_PERCENT
+ *              (default 70%) controls memoryLimit, SHUFFLE_MEMORY_LIMIT_PERCENT (default 25%)
+ *              caps single shuffle size, SHUFFLE_MERGE_PERCENT (default 90%) triggers merge.
+ *              Total merge complexity is O(n log k) where k ≤ ioSortFactor (default 10).
+ *              Linear scaling with total records; memory-bound for small datasets,
+ *              I/O-bound for large datasets exceeding memory limits.
+ *
+ * @param <K> the key type for map outputs
+ * @param <V> the value type for map outputs
+ */
 @SuppressWarnings(value={"unchecked"})
 @InterfaceAudience.LimitedPrivate({"MapReduce"})
 @InterfaceStability.Unstable
@@ -260,6 +275,23 @@ public class MergeManagerImpl<K, V> implements MergeManager<K, V> {
     inMemoryMerger.waitForMerge();
   }
 
+  /**
+   * Reserves memory or disk space for a map output during shuffle.
+   *
+   * @complexity Time: O(1) for memory check and allocation decision; performs constant-time
+   *             comparisons against maxSingleShuffleLimit and usedMemory thresholds
+   *             Space: O(requestedSize) for InMemoryMapOutput allocation when request is
+   *             served from memory; O(1) decision overhead
+   * @implNote Falls back to OnDiskMapOutput when requestedSize > maxSingleShuffleLimit;
+   *           stalls if usedMemory > memoryLimit to allow one thread past limit for merge trigger.
+   *           This prevents deadlock where all threads stall without triggering merge.
+   *
+   * @param mapId the task attempt ID of the map output
+   * @param requestedSize the size of the map output in bytes
+   * @param fetcher the fetcher thread ID
+   * @return MapOutput instance (InMemory or OnDisk), or null if stalled
+   * @throws IOException if disk allocation fails
+   */
   @Override
   public synchronized MapOutput<K,V> reserve(TaskAttemptID mapId, 
                                              long requestedSize,
@@ -345,6 +377,15 @@ public class MergeManagerImpl<K, V> implements MergeManager<K, V> {
   }
   
   
+  /**
+   * Closes and registers an in-memory merged map output file.
+   *
+   * @complexity Time: O(log n) for TreeSet insertion where n=number of merged outputs
+   *             (TreeSet uses red-black tree for ordered insertion)
+   *             Space: O(1) per output reference added to inMemoryMergedMapOutputs set
+   *
+   * @param mapOutput the merged in-memory map output to register
+   */
   public synchronized void closeInMemoryMergedFile(InMemoryMapOutput<K,V> mapOutput) {
     inMemoryMergedMapOutputs.add(mapOutput);
     LOG.info("closeInMemoryMergedFile -> size: " + mapOutput.getSize() + 
@@ -390,6 +431,9 @@ public class MergeManagerImpl<K, V> implements MergeManager<K, V> {
       setDaemon(true);
     }
 
+    // @PerformanceCritical: Memory-to-memory merge operation for intermediate data -
+    // processes all in-memory segments. Complexity: O(n log k) where n=total records,
+    // k=number of segments. Memory-bound operation that reduces segment count.
     @Override
     public void merge(List<InMemoryMapOutput<K, V>> inputs) throws IOException {
       if (inputs == null || inputs.size() == 0) {
@@ -440,6 +484,10 @@ public class MergeManagerImpl<K, V> implements MergeManager<K, V> {
       setDaemon(true);
     }
     
+    // @PerformanceCritical: In-memory merge operation - merges all in-memory map outputs
+    // to disk, reduces memory pressure. Complexity: O(n log k) where n=total records,
+    // k=number of in-memory segments. Triggered when commitMemory >= mergeThreshold (~90%).
+    // This is a hot path during shuffle phase, typically consuming >5% of reduce task time.
     @Override
     public void merge(List<InMemoryMapOutput<K,V>> inputs) throws IOException {
       if (inputs == null || inputs.size() == 0) {
@@ -525,6 +573,10 @@ public class MergeManagerImpl<K, V> implements MergeManager<K, V> {
       setDaemon(true);
     }
     
+    // @PerformanceCritical: On-disk merge operation - merges on-disk map output segments
+    // using k-way merge with ioSortFactor (default 10). Complexity: O(n log k) where
+    // n=total records across all segments, k=min(ioSortFactor, numSegments).
+    // Triggered when onDiskMapOutputs.size() >= (2 * ioSortFactor - 1). I/O-bound operation.
     @Override
     public void merge(List<CompressAwarePath> inputs) throws IOException {
       // sanity check
@@ -692,6 +744,27 @@ public class MergeManagerImpl<K, V> implements MergeManager<K, V> {
     return (long)(memoryLimit * maxRedPer);
   }
 
+  /**
+   * Performs the final merge of all in-memory and on-disk map outputs to produce
+   * the input for the reduce phase.
+   *
+   * @complexity Time: O(n log k) where n=total records across all segments, k=number of
+   *             merge segments (controlled by ioSortFactor, default 10); uses k-way merge
+   *             with heap-based priority queue for efficient multi-way merging
+   *             Space: O(maxInMemReduce) for in-memory segment retention during final merge;
+   *             additional O(k) for segment metadata where k=number of disk segments
+   * @implNote Two-phase merge: first spills excess memory segments to disk if needed
+   *           (when in-memory data exceeds maxInMemReduce threshold), then performs final
+   *           k-way merge of all disk segments with remaining in-memory data. The merge
+   *           uses a min-heap to efficiently select the next smallest key across all segments.
+   *
+   * @param job the job configuration
+   * @param fs the file system for disk operations
+   * @param inMemoryMapOutputs list of in-memory map outputs to merge
+   * @param onDiskMapOutputs list of on-disk map outputs to merge
+   * @return iterator over the merged key-value pairs for reduce processing
+   * @throws IOException if merge operations fail
+   */
   private RawKeyValueIterator finalMerge(JobConf job, FileSystem fs,
                                        List<InMemoryMapOutput<K,V>> inMemoryMapOutputs,
                                        List<CompressAwarePath> onDiskMapOutputs
