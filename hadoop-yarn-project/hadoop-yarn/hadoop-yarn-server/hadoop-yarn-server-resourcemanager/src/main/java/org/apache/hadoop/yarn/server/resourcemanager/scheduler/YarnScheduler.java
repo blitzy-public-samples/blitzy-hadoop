@@ -58,6 +58,17 @@ import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.SettableFu
  * This interface is used by the components to talk to the
  * scheduler for allocating of resources, cleaning up resources.
  *
+ * @performance Implementations must provide O(1) or O(log n) lookups for
+ *              scheduling hot paths including container lookups, node lookups,
+ *              and application lookups. The allocate() method is called on
+ *              every ApplicationMaster heartbeat and is the primary scheduling
+ *              API - implementations should optimize this path for minimal
+ *              latency. Scaling characteristics vary by implementation:
+ *              CapacityScheduler optimizes for hierarchical queue structures,
+ *              FairScheduler for fair resource sharing, and FIFO for simplicity.
+ *              Expected allocation throughput: >10,000 allocations/second for
+ *              cluster sizes up to 10,000 nodes.
+ *              Source: YarnScheduler.java:57-62
  */
 public interface YarnScheduler extends EventHandler<SchedulerEvent> {
 
@@ -69,6 +80,11 @@ public interface YarnScheduler extends EventHandler<SchedulerEvent> {
    * @param recursive get children queues?
    * @return queue information
    * @throws IOException an I/O exception has occurred.
+   * @complexity Time: O(q * d) where q=number of child queues, d=max queue depth
+   *             when recursive=true and includeChildQueues=true; O(1) for single
+   *             queue lookup when recursive=false. Space: O(q) for queue info
+   *             collection when including children; O(1) for single queue.
+   *             Source: YarnScheduler.java:73-85
    */
   @Public
   @Stable
@@ -78,6 +94,11 @@ public interface YarnScheduler extends EventHandler<SchedulerEvent> {
   /**
    * Get acls for queues for current user.
    * @return acls for queues for current user
+   * @complexity Time: O(q * u) where q=total number of queues in hierarchy,
+   *             u=average number of ACL entries per queue. Requires traversal
+   *             of entire queue hierarchy to collect ACL information.
+   *             Space: O(q * u) for the returned ACL info list.
+   *             Source: YarnScheduler.java:87-97
    */
   @Public
   @Stable
@@ -86,6 +107,16 @@ public interface YarnScheduler extends EventHandler<SchedulerEvent> {
   /**
    * Get the whole resource capacity of the cluster.
    * @return the whole resource capacity of the cluster.
+   * @complexity Time: O(1) for cached resource access. Implementations must
+   *             maintain a cached aggregate resource value updated incrementally
+   *             on node additions/removals rather than computing on-demand.
+   *             Space: O(1) constant - single Resource object reference.
+   *             Source: YarnScheduler.java:99-112
+   * @implNote This method is called frequently during scheduling decisions and
+   *           capacity calculations. Implementations should cache the cluster
+   *           resource value and update incrementally when nodes join/leave
+   *           rather than recalculating on each call. Recalculation would be
+   *           O(n) where n=number of nodes, which is unacceptable for hot paths.
    */
   @LimitedPrivate("yarn")
   @Unstable
@@ -94,6 +125,10 @@ public interface YarnScheduler extends EventHandler<SchedulerEvent> {
   /**
    * Get minimum allocatable {@link Resource}.
    * @return minimum allocatable resource
+   * @complexity Time: O(1) for configured value access. The minimum resource
+   *             capability is read from configuration at scheduler initialization
+   *             and cached. Space: O(1) constant - single Resource object.
+   *             Source: YarnScheduler.java:114-126
    */
   @Public
   @Stable
@@ -102,6 +137,12 @@ public interface YarnScheduler extends EventHandler<SchedulerEvent> {
   /**
    * Get maximum allocatable {@link Resource} at the cluster level.
    * @return maximum allocatable resource
+   * @complexity Time: O(1) for cached/computed max resource value. The maximum
+   *             resource capability may be configured statically or computed as
+   *             the maximum across all registered nodes. Implementations should
+   *             cache this value and update incrementally on node changes.
+   *             Space: O(1) constant - single Resource object.
+   *             Source: YarnScheduler.java:128-142
    */
   @Public
   @Stable
@@ -111,6 +152,11 @@ public interface YarnScheduler extends EventHandler<SchedulerEvent> {
    * Get maximum allocatable {@link Resource} for the queue specified.
    * @param queueName queue name
    * @return maximum allocatable resource
+   * @complexity Time: O(1) for queue lookup assuming hash-based queue registry;
+   *             O(d) where d=queue depth if hierarchical path traversal required.
+   *             Queue-specific max resources are typically cached per queue.
+   *             Space: O(1) constant - single Resource object returned.
+   *             Source: YarnScheduler.java:144-158
    */
   @Public
   @Stable
@@ -123,6 +169,11 @@ public interface YarnScheduler extends EventHandler<SchedulerEvent> {
   /**
    * Get the number of nodes available in the cluster.
    * @return the number of available nodes.
+   * @complexity Time: O(1) for cached count. Implementations maintain a running
+   *             count of active nodes updated on node registration/deregistration
+   *             events rather than counting on-demand.
+   *             Space: O(1) constant - single integer value.
+   *             Source: YarnScheduler.java:164-178
    */
   @Public
   @Stable
@@ -145,6 +196,22 @@ public interface YarnScheduler extends EventHandler<SchedulerEvent> {
    * blacklist.
    * @param updateRequests container promotion/demotion updates.
    * @return the {@link Allocation} for the application.
+   * @complexity Time: O(r + b + rel) where r=number of resource requests in ask,
+   *             b=size of blacklist updates (additions + removals), rel=number
+   *             of containers to release. The actual allocation decision is
+   *             implementation-dependent: CapacityScheduler uses O(q * n) where
+   *             q=queue depth, n=candidate nodes; FairScheduler uses O(a * n)
+   *             where a=applications, n=nodes. Container release processing is
+   *             O(rel). Blacklist updates are O(b) for set operations.
+   *             Space: O(c) where c=allocated containers returned in Allocation.
+   *             Source: YarnScheduler.java:180-217
+   * @implNote This method is called on every ApplicationMaster heartbeat (default
+   *           1 second interval) and is the primary scheduling API. For a cluster
+   *           with 10,000 applications each heartbeating once per second, this
+   *           method may be invoked 10,000 times/second. Implementations MUST be
+   *           highly optimized: avoid blocking I/O, minimize lock contention, use
+   *           lock-free data structures where possible. Scheduling decisions should
+   *           target <10ms latency at p99 for responsive container allocation.
    */
   @Public
   @Stable
@@ -159,6 +226,11 @@ public interface YarnScheduler extends EventHandler<SchedulerEvent> {
    * @param nodeId nodeId.
    * @return the {@link SchedulerNodeReport} for the node or null
    * if nodeId does not point to a defined node.
+   * @complexity Time: O(1) for node lookup using hash-based node registry.
+   *             Node information is maintained in a ConcurrentHashMap keyed by
+   *             NodeId for constant-time access. Space: O(1) for the returned
+   *             report object.
+   *             Source: YarnScheduler.java:219-234
    */
   @LimitedPrivate("yarn")
   @Stable
@@ -168,6 +240,11 @@ public interface YarnScheduler extends EventHandler<SchedulerEvent> {
    * Get the Scheduler app for a given app attempt Id.
    * @param appAttemptId the id of the application attempt
    * @return SchedulerApp for this given attempt.
+   * @complexity Time: O(1) for application lookup using hash-based application
+   *             registry. Applications are indexed by ApplicationAttemptId in a
+   *             ConcurrentHashMap for constant-time retrieval during scheduling.
+   *             Space: O(1) for the returned report object.
+   *             Source: YarnScheduler.java:236-250
    */
   @LimitedPrivate("yarn")
   @Stable
@@ -201,6 +278,12 @@ public interface YarnScheduler extends EventHandler<SchedulerEvent> {
    * @param queueName queue Name.
    * @return <code>true</code> if the user has the permission,
    *         <code>false</code> otherwise
+   * @complexity Time: O(a + g) where a=number of ACL entries for the queue,
+   *             g=number of groups the user belongs to. ACL checking involves
+   *             matching user identity and group memberships against queue ACL
+   *             entries. Queue lookup is O(1) or O(d) for hierarchical paths.
+   *             Space: O(1) constant - boolean return value.
+   *             Source: YarnScheduler.java:262-282
    */
   boolean checkAccess(UserGroupInformation callerUGI,
       QueueACL acl, String queueName);
@@ -209,6 +292,11 @@ public interface YarnScheduler extends EventHandler<SchedulerEvent> {
    * Gets the apps under a given queue
    * @param queueName the name of the queue.
    * @return a collection of app attempt ids in the given queue.
+   * @complexity Time: O(a) where a=number of applications currently in the
+   *             specified queue. Requires iteration over the queue's application
+   *             collection to build the returned list. Queue lookup is O(1).
+   *             Space: O(a) for the returned list of ApplicationAttemptIds.
+   *             Source: YarnScheduler.java:284-298
    */
   @LimitedPrivate("yarn")
   @Stable
@@ -219,6 +307,12 @@ public interface YarnScheduler extends EventHandler<SchedulerEvent> {
    *
    * @param containerId the given containerId.
    * @return the container for the given containerId.
+   * @complexity Time: O(1) for container lookup using hash-based container
+   *             registry. Containers are indexed by ContainerId in a
+   *             ConcurrentHashMap for constant-time access during scheduling
+   *             and status queries. Space: O(1) - returns existing container
+   *             reference, no allocation.
+   *             Source: YarnScheduler.java:300-315
    */
   @LimitedPrivate("yarn")
   @Unstable
@@ -230,6 +324,14 @@ public interface YarnScheduler extends EventHandler<SchedulerEvent> {
    * @param newQueue the given queue.
    * @return the name of the queue the application was placed into
    * @throws YarnException if the move cannot be carried out
+   * @complexity Time: O(c + v) where c=number of containers owned by the
+   *             application to be moved, v=validation checks (ACL verification,
+   *             queue capacity checks). Container resource accounting must be
+   *             updated in both source and destination queues. Implementation-
+   *             dependent: may require lock acquisition on both queues.
+   *             Space: O(1) constant - no new allocations, updates existing
+   *             data structures.
+   *             Source: YarnScheduler.java:317-336
    */
   @LimitedPrivate("yarn")
   @Evolving
@@ -304,6 +406,13 @@ public interface YarnScheduler extends EventHandler<SchedulerEvent> {
    * Gets the list of names for queues managed by the Reservation System.
    * @return the list of queues which support reservations
    * @throws YarnException when yarn exception occur.
+   * @complexity Time: O(q) where q=total number of queues in the scheduler.
+   *             Requires traversal of queue hierarchy to identify queues with
+   *             reservation system (Plan) enabled. Typically a small subset
+   *             of total queues have reservations enabled.
+   *             Space: O(p) where p=number of plan-enabled queues for the
+   *             returned Set.
+   *             Source: YarnScheduler.java:380-394
    */
   public Set<String> getPlanQueues() throws YarnException;  
 
