@@ -55,6 +55,21 @@ import org.apache.hadoop.thirdparty.com.google.common.collect.ImmutableSet;
 
 /**
  * Represents a YARN Cluster Node from the viewpoint of the scheduler.
+ *
+ * @performance Memory footprint: O(c) where c=number of allocated containers per node.
+ *              Node state operations scale with container count. Container tracking uses
+ *              HashMap (launchedContainers) providing O(1) average-case lookup/insert/delete.
+ *              Resource tracking maintains pre-computed unallocatedResource for O(1)
+ *              availability checks during scheduling decisions.
+ *              Source: SchedulerNode.java:79-80, 66-68
+ * @implNote Uses HashMap for launchedContainers to provide O(1) average-case container
+ *           lookup instead of O(n) list scan. This trade-off accepts higher memory overhead
+ *           (HashMap entry objects) for faster container access during high-frequency
+ *           scheduling operations. Volatile numContainers provides thread-safe reads without
+ *           synchronization overhead for container count queries. Resource objects
+ *           (unallocatedResource, allocatedResource, totalResource) are maintained
+ *           in-memory rather than querying RM state to avoid RPC latency during
+ *           scheduling hot paths.
  */
 @Private
 @Unstable
@@ -115,6 +130,13 @@ public abstract class SchedulerNode {
 
   /**
    * Set total resources on the node.
+   *
+   * @complexity Time: O(1) for field assignment and Resource arithmetic operations.
+   *             Space: O(1) for new Resource object creation in subtract operation.
+   *             Source: SchedulerNode.java:120-124
+   * @implNote Recalculates unallocatedResource as (totalResource - allocatedResource)
+   *           rather than incrementally adjusting. Ensures consistency after dynamic
+   *           resource updates at cost of object allocation.
    * @param resource Total resources on the node.
    */
   public synchronized void updateTotalResource(Resource resource){
@@ -196,6 +218,11 @@ public abstract class SchedulerNode {
   /**
    * The Scheduler has allocated containers on this node to the given
    * application.
+   *
+   * @complexity Time: O(1) average-case for HashMap put operation on launchedContainers;
+   *             O(n) worst-case if hash collision triggers rehashing where n=container count.
+   *             Space: O(1) per container (ContainerInfo object allocation).
+   *             Source: SchedulerNode.java:219-220
    * @param rmContainer Allocated container
    */
   public void allocateContainer(RMContainer rmContainer) {
@@ -205,6 +232,16 @@ public abstract class SchedulerNode {
   /**
    * The Scheduler has allocated containers on this node to the given
    * application.
+   *
+   * @complexity Time: O(1) average-case for HashMap put operation; includes O(1) resource
+   *             arithmetic operations (Resources.subtractFrom, Resources.addTo).
+   *             O(n) worst-case if rehashing occurs where n=container count.
+   *             Space: O(1) per container - allocates single ContainerInfo wrapper object.
+   *             Source: SchedulerNode.java:219-220
+   * @implNote Guaranteed containers trigger resource deduction and counter increment;
+   *           opportunistic containers are tracked but do not affect resource accounting.
+   *           HashMap provides O(1) average container insertion vs O(n) list append with
+   *           lookup benefits.
    * @param rmContainer Allocated container
    * @param launchedOnNode True if the container has been launched
    */
@@ -222,6 +259,14 @@ public abstract class SchedulerNode {
 
   /**
    * Get unallocated resources on the node.
+   *
+   * @complexity Time: O(1) for direct field access to cached resource object.
+   *             Space: O(1) - returns reference to existing Resource object, no allocation.
+   *             Source: SchedulerNode.java:227-229
+   * @implNote Unallocated resource is pre-computed and maintained incrementally during
+   *           allocate/release operations rather than calculated on-demand. This design
+   *           trades O(c) space for O(1) availability checks where c=container count,
+   *           critical for high-frequency scheduling decisions.
    * @return Unallocated resources on the node
    */
   public synchronized Resource getUnallocatedResource() {
@@ -230,6 +275,13 @@ public abstract class SchedulerNode {
 
   /**
    * Get allocated resources on the node.
+   *
+   * @complexity Time: O(1) for direct field access to cached resource object.
+   *             Space: O(1) - returns reference to existing Resource object, no allocation.
+   *             Source: SchedulerNode.java:235-237
+   * @implNote Allocated resource is pre-computed and maintained incrementally during
+   *           allocate/release operations. Paired with unallocatedResource for O(1)
+   *           resource availability calculations.
    * @return Allocated resources on the node
    */
   public synchronized Resource getAllocatedResource() {
@@ -238,6 +290,13 @@ public abstract class SchedulerNode {
 
   /**
    * Get total resources on the node.
+   *
+   * @complexity Time: O(1) for direct field access to cached resource object.
+   *             Space: O(1) - returns reference to existing Resource object, no allocation.
+   *             Source: SchedulerNode.java:243-245
+   * @implNote Total resource is cached at node construction and updated only on
+   *           updateTotalResource() calls (e.g., dynamic resource changes). This avoids
+   *           repeated RMNode queries during scheduling, trading memory for latency.
    * @return Total resources on the node.
    */
   public synchronized Resource getTotalResource() {
@@ -247,6 +306,13 @@ public abstract class SchedulerNode {
   /**
    * Check if a container is launched by this node.
    *
+   * @complexity Time: O(1) average-case for HashMap containsKey operation;
+   *             O(n) worst-case with hash collisions where n=container count.
+   *             Space: O(1) - no allocations, returns primitive boolean.
+   *             Source: SchedulerNode.java:253-258
+   * @implNote HashMap provides O(1) average-case container existence check vs O(n)
+   *           for list-based linear search. Critical for frequent validation during
+   *           container state updates.
    * @param containerId containerId.
    * @return If the container is launched by the node.
    */
@@ -271,6 +337,15 @@ public abstract class SchedulerNode {
 
   /**
    * Release an allocated container on this node.
+   *
+   * @complexity Time: O(1) average-case for HashMap get and remove operations;
+   *             O(n) worst-case with hash collisions where n=container count.
+   *             Includes O(1) resource arithmetic for updateResourceForReleasedContainer.
+   *             Space: O(1) - reclaims ContainerInfo object, no new allocations.
+   *             Source: SchedulerNode.java:277-311
+   * @implNote HashMap remove provides O(1) average container lookup and removal vs O(n)
+   *           for list-based storage. Allocation tag removal via AllocationTagsManager
+   *           is deferred to actual NM release to handle AM release/NM delay race conditions.
    * @param containerId ID of container to be released.
    * @param releasedByNode whether the release originates from a node update.
    */
@@ -354,6 +429,14 @@ public abstract class SchedulerNode {
 
   /**
    * Reserve container for the attempt on this node.
+   *
+   * @complexity Time: O(1) for single reservation tracking (only one reservation per node).
+   *             Space: O(1) - stores single RMContainer reference in reservedContainer field.
+   *             Source: SchedulerNode.java:69 (reservedContainer field)
+   * @implNote Node supports only one reservation at a time (reservedContainer field).
+   *           This simplifies reservation management to O(1) operations but limits
+   *           concurrent reservation attempts. Subclass implementations may add validation
+   *           but core operation remains O(1).
    * @param attempt Application attempt asking for the reservation.
    * @param schedulerKey Priority of the reservation.
    * @param container Container reserving resources for.
@@ -363,6 +446,13 @@ public abstract class SchedulerNode {
 
   /**
    * Unreserve resources on this node.
+   *
+   * @complexity Time: O(1) for clearing single reservation reference.
+   *             Space: O(1) - releases reference to reserved container, no allocation.
+   *             Source: SchedulerNode.java:69 (reservedContainer field)
+   * @implNote Reservation release is O(1) as node maintains single reservedContainer
+   *           reference. No iteration over containers required. Resource accounting
+   *           updates (if any) in subclass implementations are also O(1) arithmetic.
    * @param attempt Application attempt that had done the reservation.
    */
   public abstract void unreserveResource(SchedulerApplicationAttempt attempt);
@@ -376,6 +466,15 @@ public abstract class SchedulerNode {
 
   /**
    * Get number of active containers on the node.
+   *
+   * @complexity Time: O(1) for volatile int field read.
+   *             Space: O(1) - returns primitive int, no allocation.
+   *             Source: SchedulerNode.java:70 (numContainers field)
+   * @implNote Uses volatile int for thread-safe reads without synchronization overhead.
+   *           Counter is maintained incrementally during allocate/release operations
+   *           rather than computing launchedContainers.size() which would require
+   *           synchronization. Trade-off: slight risk of momentary inconsistency
+   *           between numContainers and actual map size during concurrent modifications.
    * @return Number of active containers on the node.
    */
   public int getNumContainers() {
@@ -384,6 +483,14 @@ public abstract class SchedulerNode {
 
   /**
    * Get the containers running on the node.
+   *
+   * @complexity Time: O(c) where c=number of containers for iteration over launchedContainers.
+   *             Space: O(c) for ArrayList allocation holding container references.
+   *             Source: SchedulerNode.java:389-395
+   * @implNote Returns defensive copy to prevent external modification of internal state.
+   *           ArrayList pre-sized to launchedContainers.size() to avoid resizing overhead.
+   *           O(c) iteration is unavoidable for copy; callers should cache result if
+   *           multiple accesses needed within same scheduling cycle.
    * @return A copy of containers running on the node.
    */
   public synchronized List<RMContainer> getCopiedListOfRunningContainers() {
@@ -396,6 +503,14 @@ public abstract class SchedulerNode {
 
   /**
    * Get the containers running on the node with AM containers at the end.
+   *
+   * @complexity Time: O(c) where c=number of containers for iteration and LinkedList
+   *             addFirst/addLast operations (both O(1) per insertion).
+   *             Space: O(c) for LinkedList allocation holding container references.
+   *             Source: SchedulerNode.java:401-411
+   * @implNote Uses LinkedList for O(1) addFirst/addLast operations to partition
+   *           containers by AM status during single iteration. Non-AM containers
+   *           added to front, AM containers to end for kill ordering preference.
    * @return A copy of running containers with AM containers at the end.
    */
   public synchronized List<RMContainer> getRunningContainersWithAMsAtTheEnd() {
@@ -414,6 +529,14 @@ public abstract class SchedulerNode {
    * Get the containers running on the node ordered by which to kill first. It
    * tries to kill AMs last, then GUARANTEED containers, and it kills
    * OPPORTUNISTIC first. If the same time, it uses the creation time.
+   *
+   * @complexity Time: O(c log c) where c=number of containers for TimSort-based
+   *             Collections.sort. Includes O(c) for getLaunchedContainers() copy.
+   *             Space: O(c) for ArrayList allocation plus O(log c) stack for TimSort.
+   *             Source: SchedulerNode.java:419-429
+   * @implNote Uses Java's TimSort (stable, adaptive) via Collections.sort. CompareToBuilder
+   *           provides clean multi-key comparison at cost of object allocation per comparison.
+   *           Kill order: OPPORTUNISTIC first, then GUARANTEED, AMs last within each category.
    * @return A copy of the running containers ordered by which to kill first.
    */
   public List<RMContainer> getContainersToKill() {
@@ -430,6 +553,12 @@ public abstract class SchedulerNode {
 
   /**
    * Get the launched containers in the node.
+   *
+   * @complexity Time: O(c) where c=number of containers for iteration over launchedContainers.
+   *             Space: O(c) for ArrayList allocation holding container references.
+   *             Source: SchedulerNode.java:435-441
+   * @implNote Returns new ArrayList (defensive copy). Unlike getCopiedListOfRunningContainers(),
+   *           does not pre-size ArrayList. Consider pre-sizing for large container counts.
    * @return List of launched containers.
    */
   protected synchronized List<RMContainer> getLaunchedContainers() {
@@ -442,6 +571,13 @@ public abstract class SchedulerNode {
 
   /**
    * Get the container for the specified container ID.
+   *
+   * @complexity Time: O(1) average-case for HashMap get operation;
+   *             O(n) worst-case with hash collisions where n=container count.
+   *             Space: O(1) - returns existing reference, no allocation.
+   *             Source: SchedulerNode.java:448-455
+   * @implNote HashMap provides O(1) average-case container lookup. Returns null
+   *           for non-existent containers rather than throwing exception.
    * @param containerId The container ID
    * @return The container for the specified container ID
    */
@@ -456,6 +592,12 @@ public abstract class SchedulerNode {
 
   /**
    * Get the reserved container in the node.
+   *
+   * @complexity Time: O(1) for direct field access.
+   *             Space: O(1) - returns existing reference, no allocation.
+   *             Source: SchedulerNode.java:461-463
+   * @implNote Single reservation per node design allows O(1) reservation lookup.
+   *           Returns null if no reservation exists.
    * @return Reserved container in the node.
    */
   public synchronized RMContainer getReservedContainer() {
@@ -464,6 +606,13 @@ public abstract class SchedulerNode {
 
   /**
    * Set the reserved container in the node.
+   *
+   * @complexity Time: O(1) for direct field assignment.
+   *             Space: O(1) - stores single reference.
+   *             Source: SchedulerNode.java:469-472
+   * @implNote Single reservation model - setting a new reservation replaces any
+   *           existing one. Callers should check/unreserve existing reservation first
+   *           if needed.
    * @param reservedContainer Reserved container in the node.
    */
   public synchronized void
